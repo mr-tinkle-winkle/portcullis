@@ -10,8 +10,8 @@ import time
 import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPolygonF
-from PySide6.QtWidgets import (QAbstractButton, QComboBox, QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout,
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
+from PySide6.QtWidgets import (QAbstractButton, QComboBox, QGraphicsOpacityEffect, QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout,
                                QWidget)
 
 from ..ui_kit import (CollapseToggleButton, CustomButton, CustomCheckBox, CustomGroupBox,
@@ -224,12 +224,64 @@ class StarButton(QAbstractButton):
         self.update()
 
 
+class EyeButton(QAbstractButton):
+    """The visibility toggle: an open eye = shown on the map; a crossed-out eye = hidden from it."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)                     # checked = visible
+        self.setChecked(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(24, 24)
+        self._theme = Theme()
+        self.toggled.connect(lambda on: self.setToolTip(
+            "Shown on the map: click to hide it (for streaming)" if on else "Hidden from the map: click to show it"))
+        self.setToolTip("Shown on the map: click to hide it (for streaming)")
+
+    def paintEvent(self, e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        c = QColor(self._theme.text())
+        c.setAlphaF((0.9 if self.isChecked() else 0.55) if not self.underMouse() else 1.0)
+        cx, cy = self.width() / 2, self.height() / 2
+        w, h = 9.0, 5.5
+        path = QPainterPath(QPointF(cx - w, cy))
+        path.quadTo(QPointF(cx, cy - 2 * h), QPointF(cx + w, cy))
+        path.quadTo(QPointF(cx, cy + 2 * h), QPointF(cx - w, cy))
+        p.setPen(QPen(c, 1.4))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+        p.setBrush(c)
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(QPointF(cx, cy), 2.6, 2.6)
+        if not self.isChecked():
+            p.setPen(QPen(c, 1.8))
+            p.drawLine(QPointF(cx - 8, cy + 7), QPointF(cx + 8, cy - 7))
+
+    def enterEvent(self, e) -> None:
+        self.update()
+
+    def leaveEvent(self, e) -> None:
+        self.update()
+
+
+def dim(widget: QWidget, on: bool, level: float = 0.45) -> None:
+    """Fade a whole row (hidden things stay listed, just quieter)."""
+    if on:
+        eff = QGraphicsOpacityEffect(widget)
+        eff.setOpacity(level)
+        widget.setGraphicsEffect(eff)
+    else:
+        widget.setGraphicsEffect(None)
+
+
 class AppRow(Surface):
     clicked = Signal(str)
     allowToggled = Signal(str, bool)
     pinToggled = Signal(str, bool)
+    visibilityToggled = Signal(str, bool)
 
-    def __init__(self, app: "model.AppView", selected: bool, pinned: bool = False):
+    def __init__(self, app: "model.AppView", selected: bool, pinned: bool = False, hidden: bool = False):
         super().__init__(radius=16)
         self.identity = app.identity
         lay = QHBoxLayout(self)
@@ -252,6 +304,11 @@ class AppRow(Surface):
         col.addWidget(self.name)
         col.addWidget(self.sub)
         lay.addLayout(col, stretch=1)
+        self.eye = EyeButton()
+        self.eye.setChecked(not hidden)
+        self.eye.toggled.connect(lambda on: self.visibilityToggled.emit(self.identity, on))
+        lay.addWidget(self.eye)
+        self.hidden = hidden
         self.star = StarButton()
         self.star.setChecked(pinned)
         self.star.setToolTip("Unpin from the top of the list" if pinned else "Pin to the top of the list")
@@ -266,6 +323,9 @@ class AppRow(Surface):
         self.setCursor(Qt.PointingHandCursor)
         self.setAttribute(Qt.WA_Hover, True)
         self._apply_colors()
+        if hidden:
+            self.name.setText(app.name + "  (hidden)")
+            dim(self, True, 0.55)
 
     def _apply_colors(self) -> None:
         # on the highlight fill, text must contrast with it (kit rule), not the normal text colour
@@ -300,11 +360,15 @@ class AppListPanel(QWidget):
     selected = Signal(str)
     allowToggled = Signal(str, bool)
     pinToggled = Signal(str, bool)
+    visibilityToggled = Signal(str, bool)
+    showHiddenToggled = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._theme = Theme()
         self._pinned: list = []
+        self._hidden: list = []
+        self._show_hidden = False
         self._apps: list = []
         self._selected: "str | None" = None
         self._rows: "dict[str, AppRow]" = {}
@@ -317,6 +381,10 @@ class AppListPanel(QWidget):
         self.search.setPlaceholderText("Search apps")
         self.search.textChanged.connect(lambda _: self._rebuild(force=True))
         outer.addWidget(self.search)
+        self.hidden_btn = CustomButton("")
+        self.hidden_btn.clicked.connect(lambda: self.showHiddenToggled.emit(not self._show_hidden))
+        self.hidden_btn.hide()
+        outer.addWidget(self.hidden_btn)
         self.scroll = SmoothScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
@@ -333,10 +401,13 @@ class AppListPanel(QWidget):
     def set_pinned(self, pinned: list) -> None:
         self._pinned = list(pinned)
 
+    def set_visibility(self, hidden: list, show_hidden: bool) -> None:
+        self._hidden, self._show_hidden = list(hidden), bool(show_hidden)
+
     def set_apps(self, apps: list, selected: "str | None") -> None:
         self._apps, self._selected = apps, selected
         sig = (tuple((a.identity, a.running, a.allowed, a.ask, a.active_count, a.blocked_count) for a in apps),
-               self.search.text(), tuple(self._pinned))
+               self.search.text(), tuple(self._pinned), tuple(self._hidden), self._show_hidden)
         if sig == self._sig:                                 # nothing visible changed: don't rebuild (kit pitfall 14)
             self.set_selected(selected)
             return
@@ -355,9 +426,15 @@ class AppListPanel(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         self._rows = {}
-        shown = [a for a in self._apps if not q or q in a.name.lower() or q in a.identity.lower()]
+        matching = [a for a in self._apps if not q or q in a.name.lower() or q in a.identity.lower()]
+        n_hidden = sum(1 for a in self._apps if a.identity in self._hidden)
+        shown = [a for a in matching if self._show_hidden or a.identity not in self._hidden]
+        self.hidden_btn.setVisible(n_hidden > 0)
+        self.hidden_btn.setText(f"Hide the {n_hidden} hidden app{'s' if n_hidden != 1 else ''}" if self._show_hidden
+                                else f"Show {n_hidden} hidden app{'s' if n_hidden != 1 else ''}")
         for a in shown:
-            row = AppRow(a, a.identity == self._selected, a.identity in self._pinned)
+            row = AppRow(a, a.identity == self._selected, a.identity in self._pinned, a.identity in self._hidden)
+            row.visibilityToggled.connect(self.visibilityToggled)
             row.clicked.connect(self.selected)
             row.allowToggled.connect(self.allowToggled)
             row.pinToggled.connect(self.pinToggled)
@@ -367,14 +444,15 @@ class AppListPanel(QWidget):
             msg = "No apps match." if q else "No apps yet. Start an app and it will appear here."
             self.body_lay.addWidget(_label(msg, muted_=True, wrap=True))
         self.body_lay.addStretch(1)
-        self._sig = (self._sig[0], self.search.text(), tuple(self._pinned)) if self._sig else None
+        self._sig = (self._sig[0], self.search.text(), tuple(self._pinned), tuple(self._hidden), self._show_hidden) if self._sig else None
 
 
 # ============================================================================== connection rows (right)
 class ConnectionRow(Surface):
     allowToggled = Signal(str, int, str, bool)           # ip, port (0 = whole address), proto, allowed
+    visibilityToggled = Signal(str, bool)                # ip, visible on the map
 
-    def __init__(self, r: "model.RemoteView", advanced: bool, focused: bool):
+    def __init__(self, r: "model.RemoteView", advanced: bool, focused: bool, hidden: bool = False):
         super().__init__(radius=12)
         self.ip = r.ip
         v = QVBoxLayout(self)
@@ -403,6 +481,10 @@ class ConnectionRow(Surface):
             self.toggle_btn.setFixedSize(26, 26)
             self.toggle_btn.setToolTip("Per-port controls")
             top.addWidget(self.toggle_btn)
+        self.eye = EyeButton()
+        self.eye.setChecked(not hidden)
+        self.eye.toggled.connect(lambda on: self.visibilityToggled.emit(r.ip, on))
+        top.addWidget(self.eye)
         self.allow = StateCheckBox("")
         self.allow.setChecked(not r.blocked)
         self.allow.setToolTip("Allow this connection (off blocks that address)")
@@ -429,6 +511,8 @@ class ConnectionRow(Surface):
             self.toggle_btn.toggled.connect(self.ports_box.setVisible)
         self.set_highlighted(focused)
         self.lock_height()
+        if hidden:
+            dim(self, True, 0.55)
 
     def _paint_dot(self, e) -> None:
         p = QPainter(self.dot)
@@ -447,6 +531,7 @@ class DetailPanel(QWidget):
     changeRequested = Signal(str, dict)                       # identity, {block_in: ..., ask: ...}
     remoteToggled = Signal(str, str, int, str, bool)          # identity, ip, port, proto, allowed
     portRequested = Signal(str, str, str, dict)               # identity, action (add|remove|enable|disable), port name, spec
+    remoteVisibilityToggled = Signal(str, str, bool)          # identity, ip, visible on the map
 
     ASK_MODES = (("default", "Follow the global setting"), ("ask", "Always ask"), ("allow", "Always allow"))
 
@@ -458,6 +543,7 @@ class DetailPanel(QWidget):
         self.focus_ip: "str | None" = None
         self._sig = None
         self._draft = {"name": "", "port": 0, "proto": 0, "direction": 0}      # the 'add a port' form survives rebuilds
+        self.hidden_remotes: set = set()
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         self.scroll = SmoothScrollArea()
@@ -492,6 +578,7 @@ class DetailPanel(QWidget):
             app.identity, app.running, app.allowed, app.ask, app.profile, advanced, focus_ip,
             tuple(sorted((app.settings or {}).items())),
             tuple((x["name"], x["port"], x["proto"], x["direction"], x["enabled"]) for x in app.ports),
+            tuple(sorted(k for k in self.hidden_remotes if k.startswith(app.identity + "|"))),
             tuple((r.ip, r.direction, r.active, r.blocked, r.rule, r.temp_allowed, r.hostname,
                    tuple((p["proto"], p["port"], p.get("rule"), p.get("active")) for p in r.ports)) for r in app.remotes))
         if sig == self._sig:
@@ -567,7 +654,9 @@ class DetailPanel(QWidget):
             if not items:
                 bl.addWidget(_label("None seen yet." if direction == "out" else "None seen.", muted_=True))
             for r in items[:MAX_ROWS]:
-                row_w = ConnectionRow(r, self.advanced, r.ip == self.focus_ip)
+                hidden = model.remote_key(app.identity, r.ip) in self.hidden_remotes
+                row_w = ConnectionRow(r, self.advanced, r.ip == self.focus_ip, hidden)
+                row_w.visibilityToggled.connect(lambda ip, on, i=app.identity: self.remoteVisibilityToggled.emit(i, ip, on))
                 row_w.allowToggled.connect(lambda ip, port, proto, on, i=app.identity: self.remoteToggled.emit(i, ip, port, proto, on))
                 bl.addWidget(row_w)
             if len(items) > MAX_ROWS:
@@ -663,6 +752,7 @@ class DetailPanel(QWidget):
 class Banner(QWidget):
     """The strip above the map: service down / questions waiting."""
     reviewClicked = Signal()
+    restartClicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -677,15 +767,21 @@ class Banner(QWidget):
         self.button = CustomButton("Review")
         self.button.clicked.connect(self.reviewClicked)
         lay.addWidget(self.button)
+        self.restart = CustomButton("Restart service")
+        self.restart.setToolTip("systemctl restart portcullis.service")
+        self.restart.clicked.connect(self.restartClicked)
+        self.restart.hide()
+        lay.addWidget(self.restart)
         self.setFixedHeight(46)
         self.hide()
 
-    def show_state(self, text: str, button: bool = False, kind: str = "special") -> None:
+    def show_state(self, text: str, button: bool = False, kind: str = "special", restart: bool = False) -> None:
         """kind: 'special' (purple: needs you) or 'off' (red: something is broken)."""
         sig = palette.signals()
         self._fill = sig.off if kind == "off" else sig.special
         self.label.setText(text)
         self.button.setVisible(button)
+        self.restart.setVisible(restart)
         self.setVisible(bool(text))
         c = contrast_text(self._fill)
         self.label.setStyleSheet(f"QLabel {{ color: {c.name()}; }}")

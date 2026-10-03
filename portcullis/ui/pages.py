@@ -106,6 +106,17 @@ class SettingsPage(Page):
             c.addWidget(w)
         b.addWidget(conns)
 
+        view = CustomGroupBox("Map")
+        vw = view.make_layout(QVBoxLayout)
+        self.globe = StateCheckBox("Show a globe instead of the flat map (drag to spin it)")
+        self.show_hidden = StateCheckBox("List hidden apps on the left (dimmed); they stay off the map either way")
+        vw.addWidget(self.globe)
+        vw.addWidget(self.show_hidden)
+        vw.addWidget(QLabel("The eye next to an app or a connection hides it from the map, e.g. while streaming. "
+                            "Drag the gaps between the list, the map and the connection panel to resize them."))
+        vw.itemAt(vw.count() - 1).widget().setWordWrap(True)
+        b.addWidget(view)
+
         loc = CustomGroupBox("My location on the map")
         l = loc.make_layout(QVBoxLayout)
         hint = QLabel("Drag the \"My Location\" pin on the map, or type coordinates. It's only a drawing: "
@@ -186,6 +197,10 @@ class SettingsPage(Page):
         self.notifications.toggled.connect(lambda on: self._gui("notifications", on))
         self.advanced.toggled.connect(lambda on: self._gui("advanced_ports", on))
         self.resolve.toggled.connect(lambda on: self._gui("resolve_hostnames", on))
+        self.globe.toggled.connect(lambda on: self._gui("map_mode", "globe" if on else "flat"))
+        self.show_hidden.toggled.connect(lambda on: self._gui("show_hidden", on))
+        self.globe.setChecked(cfg.map_mode == "globe")
+        self.show_hidden.setChecked(cfg.show_hidden)
         self.notifications.setChecked(cfg.notifications)
         self.advanced.setChecked(cfg.advanced_ports)
         self.resolve.setChecked(cfg.resolve_hostnames)
@@ -201,6 +216,15 @@ class SettingsPage(Page):
         if not self._loading:
             setattr(self.cfg, key, value)
             self.guiSettingChanged.emit()
+
+    def sync_gui(self, cfg) -> None:
+        """Reflect changes made elsewhere (the map's corner button, the list's 'show hidden') without echoing them."""
+        was, self._loading = self._loading, True
+        try:
+            self.globe.setChecked(cfg.map_mode == "globe")
+            self.show_hidden.setChecked(cfg.show_hidden)
+        finally:
+            self._loading = was
 
     def load_daemon_settings(self, s: dict) -> None:
         """Show the daemon's current settings (without echoing them back as changes)."""

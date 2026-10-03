@@ -33,6 +33,11 @@ class GuiConfig:
     resolve_hostnames: bool = False      # reverse-DNS the remote addresses (asks your DNS resolver about each one)
     notifications: bool = True           # desktop notification for every question in ask mode
     pinned: list = field(default_factory=list)   # app identities pinned to the top of the list
+    hidden_apps: list = field(default_factory=list)      # app identities kept off the map (visibility toggle)
+    hidden_remotes: list = field(default_factory=list)   # "identity|ip": single connections kept off the map
+    show_hidden: bool = False            # still list hidden apps (dimmed) on the left
+    map_mode: str = "flat"               # "flat" | "globe"
+    split_sizes: list = field(default_factory=list)      # widths of app list | map | connection panel
     signal_input: str = "#f2994a"        # orange: input / incoming
     signal_output: str = "#4da3ff"       # blue: output / outgoing
     signal_special: str = "#b07cff"      # purple: both directions / special
@@ -45,6 +50,12 @@ class GuiConfig:
         self.my_lat = max(-85.0, min(85.0, float(self.my_lat)))
         self.my_lon = max(-180.0, min(180.0, float(self.my_lon)))
         self.pinned = list(dict.fromkeys(str(x) for x in self.pinned if isinstance(x, str) and x))
+        self.hidden_apps = list(dict.fromkeys(x for x in self.hidden_apps if isinstance(x, str) and x))
+        self.hidden_remotes = list(dict.fromkeys(x for x in self.hidden_remotes if isinstance(x, str) and "|" in x))
+        if self.map_mode not in ("flat", "globe"):
+            self.map_mode = "flat"
+        sizes = [int(x) for x in self.split_sizes if isinstance(x, int) and not isinstance(x, bool)]
+        self.split_sizes = sizes if len(sizes) == 3 and all(x >= 0 for x in sizes) and sum(sizes) > 0 else []
         import re
         for name in ("signal_input", "signal_output", "signal_special", "signal_on", "signal_off"):
             if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(getattr(self, name))):

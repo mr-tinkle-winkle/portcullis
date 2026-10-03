@@ -38,7 +38,7 @@
         in
         python.pkgs.buildPythonApplication {
           pname = "portcullis";
-          version = "0.2.0";
+          version = "0.3.0";
           format = "pyproject";
           src = ./.;
 
@@ -163,6 +163,21 @@
                 RestartSec = 5;
               };
             };
+
+            # Let the window's "Restart service" button work without a password for members of the group.
+            security.polkit.enable = lib.mkDefault true;
+            security.polkit.extraConfig = ''
+              polkit.addRule(function (action, subject) {
+                if (action.id == "org.freedesktop.systemd1.manage-units" &&
+                    action.lookup("unit") == "portcullis.service" &&
+                    subject.isInGroup("portcullis")) {
+                  var verb = action.lookup("verb");
+                  if (verb == "start" || verb == "stop" || verb == "restart") {
+                    return polkit.Result.YES;
+                  }
+                }
+              });
+            '';
 
             systemd.services.portcullis = {
               description = "portcullis: per-app network block / latency";

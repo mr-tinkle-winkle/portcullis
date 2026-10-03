@@ -8,7 +8,7 @@ From the daemon's ``overview`` reply to what the window draws (no Qt in here).
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .. import appid, geo
 
@@ -142,6 +142,22 @@ def build_pins(apps: "list[AppView]", precision: int = 1) -> "list[Pin]":
                 p = pins[key] = Pin(r.place.lat, r.place.lon, r.place.label, [])
             p.items.append((app, r))
     return sorted(pins.values(), key=lambda p: (-p.active, p.label))
+
+
+def remote_key(identity: str, ip: str) -> str:
+    return f"{identity}|{ip}"
+
+
+def for_map(apps: "list[AppView]", hidden_apps=(), hidden_remotes=()) -> "list[AppView]":
+    """What the map may show: hidden apps left out, hidden connections removed from the rest."""
+    hidden_apps, hidden_remotes = set(hidden_apps), set(hidden_remotes)
+    out = []
+    for a in apps:
+        if a.identity in hidden_apps:
+            continue
+        keep = [r for r in a.remotes if remote_key(a.identity, r.ip) not in hidden_remotes]
+        out.append(a if len(keep) == len(a.remotes) else replace(a, remotes=keep))
+    return out
 
 
 def local_items(apps: "list[AppView]") -> "list[tuple]":

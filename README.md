@@ -59,6 +59,14 @@ Left: every app with connections; the star pins an app to the top (kept even whe
 incoming/outgoing remotes, each with an allow toggle (all on by default) plus a master **Allow**.
 Rules are per remote IP, any port; **Advanced** in Settings adds per-port rows and a per-port ask toggle.
 
+**Map**: the corner button switches between the flat map and a **globe** (drag to spin, wheel to zoom,
+double-click to reset); Settings -> Map has the same switch. Drag the gaps between the app list, the map and the
+connection panel to **resize** them (remembered). The **eye** next to an app or a single connection hides it from
+the map (for streaming); hidden apps also leave the list unless you click "Show N hidden apps".
+
+**Service down?** The red banner has a **Restart service** button (`systemctl restart portcullis.service`); the
+NixOS module adds a polkit rule so members of the `portcullis` group can do that without a password.
+
 **Named ports** (purple box in the app panel, or the CLI above): give a port number a name for that app,
 then switch it on or off. Off = that port is dropped in the kernel, for any remote address, on either end of
 the connection (so it covers ports the app connects to and ports it listens on), per protocol and direction.
@@ -85,7 +93,7 @@ If the delay listener dies, packets are accepted (fail-open), never stranded.
 
 Also verified on a real kernel: ask-hold then allow, block-always, hold timeout drop, incoming ask, and
 per-address / per-port block rules in both directions, and named ports (disabled port drops only that port, protocol
-and direction are honoured, incoming listen ports). UI: 41 offscreen tests, including live round-trips to a
+and direction are honoured, incoming listen ports). UI: 58 offscreen tests, including live round-trips to a
 real control server, and rendered screenshots checked by eye.
 
 Verified on a real kernel in network namespaces (54 tests): blocking each direction independently,

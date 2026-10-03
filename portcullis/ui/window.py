@@ -3,13 +3,13 @@ and the connection panel of the selected app, with a banner for the service stat
 waiting in ask mode."""
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QPalette
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QHBoxLayout, QMainWindow, QSizePolicy,
-                               QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtCore import QRectF, QTimer, Qt
+from PySide6.QtGui import QColor, QPainter, QPalette
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QDialog, QHBoxLayout, QMainWindow, QSizePolicy, QSplitter,
+                               QSplitterHandle, QStackedWidget, QVBoxLayout, QWidget)
 
 from .. import geo as geomod
-from ..ui_kit import SegmentButton, Theme, compute_scale, crossfade_to_index, show_message
+from ..ui_kit import SegmentButton, Theme, compute_scale, crossfade_to_index, rounded_rect_path, show_message
 from . import config as guicfg
 from . import model
 from .bridge import Bridge
@@ -17,6 +17,7 @@ from .mapview import MapWidget
 from .notifier import Notifier
 from .pages import Page, SettingsPage
 from .resolver import Resolver
+from .service import ServiceControl
 from .widgets import AppListPanel, Banner, DetailPanel, PendingPanel
 
 
@@ -37,10 +38,35 @@ class PendingDialog(QDialog):
         lay.addWidget(self.panel)
 
 
+class _Handle(QSplitterHandle):
+    """A splitter handle you can see: a short rounded grip, brighter under the mouse."""
+
+    def __init__(self, orientation, parent):
+        super().__init__(orientation, parent)
+        self.setAttribute(Qt.WA_Hover, True)
+        self._theme = Theme()
+
+    def paintEvent(self, e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        c = QColor(self._theme.text())
+        c.setAlphaF(0.55 if self.underMouse() else 0.18)
+        h = min(64.0, self.height() * 0.2)
+        r = QRectF(self.width() / 2 - 2, self.height() / 2 - h / 2, 4, h)
+        p.fillPath(rounded_rect_path(r, 2), c)
+
+
+class Splitter(QSplitter):
+    """App list | map | connection panel, each resizable by dragging the gaps between them."""
+
+    def createHandle(self) -> QSplitterHandle:
+        return _Handle(self.orientation(), self)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, bridge: "Bridge | None" = None, geo: "geomod.Geo | None" = None, cfg=None,
                  notifier: "Notifier | None" = None, resolver: "Resolver | None" = None, poll_ms: int = 1000,
-                 downloader=None):
+                 downloader=None, service: "ServiceControl | None" = None):
         super().__init__()
         self.setWindowTitle("Portcullis")
         self.cfg = cfg or guicfg.load()
@@ -49,6 +75,8 @@ class MainWindow(QMainWindow):
         self.resolver = resolver or Resolver()
         self.notifier = notifier
         self._download = downloader or geomod.update
+        self.service = service or ServiceControl(self)
+        self.service.finished.connect(self.on_service_restarted)
         self.apps: "list[model.AppView]" = []
         self.pending: list = []
         self.selected: "str | None" = None
@@ -84,18 +112,26 @@ class MainWindow(QMainWindow):
         self.map_page = Page(scrollable=False)
         self.banner = Banner()
         self.map_page.body_layout.addWidget(self.banner)
-        cols = QHBoxLayout()
-        cols.setSpacing(pad)
+        self.split = Splitter(Qt.Horizontal)
+        self.split.setHandleWidth(pad)
+        self.split.setChildrenCollapsible(False)
         self.applist = AppListPanel()
         self.map = MapWidget()
         self.detail = DetailPanel()
-        self.applist.setMinimumWidth(200)
-        self.detail.setMinimumWidth(280)
-        cols.addWidget(self.applist, 22)
-        cols.addWidget(self.map, 50)
-        cols.addWidget(self.detail, 28)
-        self.map_page.body_layout.addLayout(cols, stretch=1)
+        self.applist.setMinimumWidth(250)
+        self.map.setMinimumWidth(280)
+        self.detail.setMinimumWidth(260)
+        for i, (w, stretch) in enumerate(((self.applist, 22), (self.map, 50), (self.detail, 28))):
+            self.split.addWidget(w)
+            self.split.setStretchFactor(i, stretch)
+        if self.cfg.split_sizes:
+            self.split.setSizes(self.cfg.split_sizes)
+        else:
+            self.split.setSizes([300, 700, 400])
+        self.split.splitterMoved.connect(lambda *_: self._remember_split())
+        self.map_page.body_layout.addWidget(self.split, stretch=1)
         self.map.set_me(self.cfg.my_lat, self.cfg.my_lon)
+        self.map.set_mode(self.cfg.map_mode)
 
         # ---- settings page
         self.settings_page = SettingsPage(self.cfg)
@@ -117,12 +153,17 @@ class MainWindow(QMainWindow):
         self.applist.selected.connect(self.select_app)
         self.applist.allowToggled.connect(self.on_app_allow)
         self.applist.pinToggled.connect(self.on_pin_toggled)
+        self.applist.visibilityToggled.connect(self.on_app_visibility)
+        self.applist.showHiddenToggled.connect(self.on_show_hidden)
+        self.detail.remoteVisibilityToggled.connect(self.on_remote_visibility)
+        self.map.modeChanged.connect(self.on_map_mode)
         self.map.appSelected.connect(self.on_pin_selected)
         self.map.locationChanged.connect(self.on_location)
         self.detail.changeRequested.connect(self.on_change)
         self.detail.remoteToggled.connect(self.on_remote)
         self.detail.portRequested.connect(self.on_port)
         self.banner.reviewClicked.connect(self.show_pending)
+        self.banner.restartClicked.connect(self.restart_service)
         self.pending_dialog.panel.decided.connect(self.decide)
         s = self.settings_page
         s.daemonSettingChanged.connect(lambda ch: self.bridge.send({"cmd": "settings", "changes": ch}, "settings"))
@@ -187,21 +228,21 @@ class MainWindow(QMainWindow):
         if self.notifier is not None:
             self.notifier.sync(self.pending, self.cfg.notifications)
         sig = (model.signature(self.apps, self.pending), self.selected, self.focus_ip, self.cfg.advanced_ports,
+               tuple(self.cfg.hidden_apps), tuple(self.cfg.hidden_remotes), self.cfg.show_hidden,
                tuple(self.cfg.__dict__.get(k) for k in ("my_lat", "my_lon")), tuple(sorted(ov.get("flow_errors", {}))), ov.get("error", ""))
         self._refresh_banner(ov)
         self.pending_dialog.panel.set_pending(self.pending, self.label_for)
         if sig == self._sig:
             return
         self._sig = sig
-        self.applist.set_pinned(self.cfg.pinned)
-        self.applist.set_apps(self.apps, self.selected)
-        self.map.set_data(model.build_pins(self.apps), model.local_items(self.apps), self.selected)
-        self.detail.show_app(self.app(self.selected), self.cfg.advanced_ports, self.focus_ip)
+        self._push()
         self._update_hint()
 
     def on_down(self, reason: str) -> None:
         self._down_reason = reason
-        self.banner.show_state(reason, kind="off")
+        if self.service.busy:
+            return
+        self.banner.show_state(reason, kind="off", restart=True)
 
     def _refresh_banner(self, ov: dict) -> None:
         n = len(self.pending)
@@ -238,9 +279,18 @@ class MainWindow(QMainWindow):
         self.on_overview_refresh()
 
     def on_overview_refresh(self) -> None:
+        self._push()
+
+    def _push(self) -> None:
+        """Hand the current apps to the list, the map (minus anything hidden) and the connection panel."""
+        cfg = self.cfg
+        self.applist.set_pinned(cfg.pinned)
+        self.applist.set_visibility(cfg.hidden_apps, cfg.show_hidden)
         self.applist.set_apps(self.apps, self.selected)
-        self.map.set_data(model.build_pins(self.apps), model.local_items(self.apps), self.selected)
-        self.detail.show_app(self.app(self.selected), self.cfg.advanced_ports, self.focus_ip)
+        shown = model.for_map(self.apps, cfg.hidden_apps, cfg.hidden_remotes)
+        self.map.set_data(model.build_pins(shown), model.local_items(shown), self.selected)
+        self.detail.hidden_remotes = set(cfg.hidden_remotes)
+        self.detail.show_app(self.app(self.selected), cfg.advanced_ports, self.focus_ip)
 
     # ---- actions → daemon -----------------------------------------------------------------------------------------
     def on_app_allow(self, identity: str, allowed: bool) -> None:
@@ -265,6 +315,17 @@ class MainWindow(QMainWindow):
         if action == "add":
             cmd["spec"] = spec
         self.bridge.send(cmd, "port")
+
+    def restart_service(self) -> None:
+        self.banner.show_state("Restarting the portcullis service…", kind="special")
+        self.service.restart()
+
+    def on_service_restarted(self, ok: bool, message: str) -> None:
+        if ok:
+            QTimer.singleShot(800, self.bridge.poll)                 # the socket needs a moment to appear
+        else:
+            self.banner.show_state(self._down_reason or "The service isn't running", kind="off", restart=True)
+            show_message(self, "Restart service", "Couldn't restart the service:\n\n" + message)
 
     def decide(self, ask_id: int, decision: str) -> None:
         self.bridge.send({"cmd": "answer", "id": ask_id, "decision": decision}, "answer")
@@ -298,7 +359,47 @@ class MainWindow(QMainWindow):
         else:
             self.on_overview_refresh()
 
+    # ---- visibility, map mode, layout ------------------------------------------------------------------------------
+    @staticmethod
+    def _toggle(items: list, key: str, present: bool) -> None:
+        if present and key not in items:
+            items.append(key)
+        elif not present and key in items:
+            items.remove(key)
+
+    def on_app_visibility(self, identity: str, visible: bool) -> None:
+        self._toggle(self.cfg.hidden_apps, identity, not visible)
+        guicfg.save(self.cfg)
+        self._sig = None
+        self._push()
+
+    def on_remote_visibility(self, identity: str, ip: str, visible: bool) -> None:
+        self._toggle(self.cfg.hidden_remotes, model.remote_key(identity, ip), not visible)
+        guicfg.save(self.cfg)
+        self._sig = None
+        self._push()
+
+    def on_show_hidden(self, on: bool) -> None:
+        self.cfg.show_hidden = on
+        self.settings_page.sync_gui(self.cfg)
+        guicfg.save(self.cfg)
+        self._push()
+
+    def on_map_mode(self, mode: str) -> None:
+        self.cfg.map_mode = mode
+        self.settings_page.sync_gui(self.cfg)
+        guicfg.save(self.cfg)
+
+    def _remember_split(self) -> None:
+        self.cfg.split_sizes = self.split.sizes()
+        if not hasattr(self, "_split_timer"):                    # save once the drag settles, not on every pixel
+            self._split_timer = QTimer(self)
+            self._split_timer.setSingleShot(True)
+            self._split_timer.timeout.connect(lambda: guicfg.save(self.cfg))
+        self._split_timer.start(400)
+
     def on_gui_setting(self) -> None:
+        self.map.set_mode(self.cfg.map_mode)
         guicfg.save(self.cfg)
         self._sig = None
         self.on_overview_refresh()

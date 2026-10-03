@@ -764,3 +764,177 @@ def test_importing_a_location_file_from_the_settings_page(win, tmp_path):
     finally:
         winmod.geomod.install_file = orig
     assert calls == ["/some/db.mmdb.gz"]
+
+
+# -- restart button, visibility, splitter, globe ----------------------------------------------------------------------
+class FakeService(__import__("PySide6.QtCore", fromlist=["QObject"]).QObject):
+    finished = __import__("PySide6.QtCore", fromlist=["Signal"]).Signal(bool, str)
+
+    def __init__(self, ok=True, msg=""):
+        super().__init__()
+        self.calls, self.ok, self.msg, self.busy = 0, ok, msg, False
+
+    def restart(self):
+        self.calls += 1
+        self.finished.emit(self.ok, self.msg)
+
+
+def _down_window(qapp, tmp_path, monkeypatch, service):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from portcullis.ui.window import MainWindow
+    def down(cmd):
+        raise ConnectionError("the portcullis service isn't running (/run/portcullis/control.sock doesn't exist)")
+    w = MainWindow(bridge=Bridge(request=down), geo=FakeGeo(), cfg=guicfg.load(), poll_ms=10 ** 6, service=service)
+    w.show()
+    wait(300)
+    return w
+
+
+def test_restart_button_appears_when_the_service_is_down_and_runs_systemctl(qapp, tmp_path, monkeypatch):
+    svc = FakeService(ok=True)
+    w = _down_window(qapp, tmp_path, monkeypatch, svc)
+    assert w.banner.isVisible() and w.banner.restart.isVisible() and "isn't running" in w.banner.label.text()
+    w.banner.restart.click()
+    assert svc.calls == 1
+    w.shutdown()
+
+
+def test_a_failed_restart_says_why(qapp, tmp_path, monkeypatch):
+    from unittest import mock
+    svc = FakeService(ok=False, msg="Access denied")
+    w = _down_window(qapp, tmp_path, monkeypatch, svc)
+    with mock.patch("portcullis.ui.window.show_message") as sm:
+        w.banner.restart.click()
+    assert "Access denied" in sm.call_args[0][2] and w.banner.restart.isVisible()
+    w.shutdown()
+
+
+def test_service_control_reports_success_and_failure_of_the_real_process(qapp, tmp_path):
+    from portcullis.ui.service import ServiceControl
+    results = []
+    for script, expect in (("#!/bin/sh\nexit 0\n", True), ("#!/bin/sh\necho 'Failed to restart: Access denied' >&2\nexit 1\n", False)):
+        prog = tmp_path / f"fake-systemctl-{expect}"
+        prog.write_text(script)
+        prog.chmod(0o755)
+        sc = ServiceControl(program=str(prog))
+        got = []
+        sc.finished.connect(lambda ok, msg: got.append((ok, msg)))
+        sc.restart()
+        for _ in range(100):
+            if got:
+                break
+            wait(20)
+        results.append(got[0])
+        assert got[0][0] is expect
+    assert "Access denied" in results[1][1]
+    sc = ServiceControl(program=str(tmp_path / "does-not-exist"))
+    got = []
+    sc.finished.connect(lambda ok, msg: got.append((ok, msg)))
+    sc.restart()
+    wait(300)
+    assert got and got[0][0] is False
+
+
+def test_hiding_an_app_takes_it_off_the_map_and_the_list(win):
+    w, rec = win
+    def on_map(ident):
+        return any(a.identity == ident for p in w.map.pins for a in p.apps()) or any(a.identity == ident for a, _ in w.map.local_items)
+    assert on_map("app:firefox")
+    w.applist._rows["app:firefox"].eye.setChecked(False)
+    assert w.cfg.hidden_apps == ["app:firefox"] and guicfg.load().hidden_apps == ["app:firefox"]
+    assert not on_map("app:firefox") and "app:firefox" not in w.applist._rows
+    assert w.applist.hidden_btn.isVisible() and "Show 1 hidden app" in w.applist.hidden_btn.text()
+    w.applist.hidden_btn.click()                                  # list them (dimmed), still off the map
+    assert "app:firefox" in w.applist._rows and w.applist._rows["app:firefox"].graphicsEffect() is not None
+    assert not on_map("app:firefox") and w.settings_page.show_hidden.isChecked()
+    w.applist._rows["app:firefox"].eye.setChecked(True)
+    assert w.cfg.hidden_apps == [] and on_map("app:firefox")
+
+
+def test_hiding_one_connection_removes_only_that_pin(win):
+    from portcullis.ui.widgets import ConnectionRow
+    w, rec = win
+    w.select_app("app:firefox")
+    tokyo = lambda: [p for p in w.map.pins if any(r.ip == "13.107.42.14" for _, r in p.items)]
+    assert tokyo()
+    n = len(w.map.pins)
+    row = next(r for r in w.detail.findChildren(ConnectionRow) if r.ip == "13.107.42.14")
+    row.eye.setChecked(False)
+    assert w.cfg.hidden_remotes == ["app:firefox|13.107.42.14"] and not tokyo() and len(w.map.pins) == n - 1
+    row = next(r for r in w.detail.findChildren(ConnectionRow) if r.ip == "13.107.42.14")
+    assert not row.eye.isChecked() and row.graphicsEffect() is not None          # still listed, dimmed
+    row.eye.setChecked(True)
+    assert w.cfg.hidden_remotes == [] and tokyo()
+
+
+def test_for_map_filters_without_touching_the_originals():
+    apps = model.build_apps(overview(), FakeGeo().lookup)
+    ff = next(a for a in apps if a.identity == "app:firefox")
+    shown = model.for_map(apps, ["app:steam"], ["app:firefox|13.107.42.14"])
+    assert "app:steam" not in [a.identity for a in shown]
+    assert "13.107.42.14" not in [r.ip for a in shown if a.identity == "app:firefox" for r in a.remotes]
+    assert "13.107.42.14" in [r.ip for r in ff.remotes]
+
+
+def test_splitter_resizes_the_map_and_remembers_it(win):
+    w, rec = win
+    w.resize(1500, 860)
+    wait(100)
+    w.split.setSizes([300, 900, 300])
+    w.split.splitterMoved.emit(0, 1)
+    wait(600)
+    saved = guicfg.load().split_sizes
+    assert len(saved) == 3 and saved == w.split.sizes() and w.map.width() == saved[1]
+
+
+def test_config_cleans_visibility_and_layout_values():
+    c = guicfg.GuiConfig(hidden_apps=["a", "a", 3], hidden_remotes=["a|1.2.3.4", "junk"], map_mode="cube",
+                         split_sizes=[1, 2]).sanitize()
+    assert c.hidden_apps == ["a"] and c.hidden_remotes == ["a|1.2.3.4"] and c.map_mode == "flat" and c.split_sizes == []
+    assert guicfg.GuiConfig(split_sizes=[200, 600, 300]).sanitize().split_sizes == [200, 600, 300]
+
+
+def test_globe_projection_roundtrips_and_hides_the_far_side():
+    from portcullis.ui.mapview import Globe
+    g = Globe(zoom=1.3, lon0=-90.0, lat0=40.0)
+    for lon, lat in ((-90, 40), (-122.4, 37.8), (-46.6, -23.5), (0, 51.5)):
+        assert g.visible(lon, lat)
+        x, y = g.project(lon, lat, 800, 600)
+        lo, la = g.unproject(x, y, 800, 600)
+        assert math.isclose(lo, lon, abs_tol=1e-6) and math.isclose(la, lat, abs_tol=1e-6)
+    assert g.project(-90, 40, 800, 600) == (400.0, 300.0)           # the facing point is the centre
+    assert not g.visible(90, -40)                                    # the antipode is behind
+    assert g.unproject(5, 5, 800, 600) is None                       # a corner is off the globe
+
+
+def test_globe_mode_toggle_drag_spins_and_pins_behind_are_not_clickable(qapp):
+    m, _ = _map(qapp)
+    modes = []
+    m.modeChanged.connect(modes.append)
+    m.repaint()
+    QTest.mouseClick(m, Qt.LeftButton, Qt.NoModifier, m._mode_rect.center().toPoint())
+    assert m.mode == "globe" and modes == ["globe"]
+    assert math.isclose(m.view.lon0, -87.98, abs_tol=0.01)          # turned to face you
+    m.repaint()
+    lon0 = m.view.lon0
+    start = QPointF(m.width() / 2 + 120, m.height() / 2 + 150).toPoint()
+    QTest.mousePress(m, Qt.LeftButton, Qt.NoModifier, start)
+    QTest.mouseMove(m, start + QPointF(-200, 0).toPoint())
+    QTest.mouseRelease(m, Qt.LeftButton, Qt.NoModifier, start + QPointF(-200, 0).toPoint())
+    assert m.view.lon0 > lon0 + 10                                   # dragged left -> the globe turned east
+    sydney = next(p for p in m.pins if p.label.startswith("Sydney"))
+    m.view.lon0, m.view.lat0 = -40.0, 40.0                           # Sydney is now on the far side
+    assert not m.view.visible(sydney.lon, sydney.lat)
+    assert m._pin_at(m._pt(sydney.lat, sydney.lon)) is None
+    m.repaint()
+    QTest.mouseClick(m, Qt.LeftButton, Qt.NoModifier, m._mode_rect.center().toPoint())
+    assert m.mode == "flat" and modes == ["globe", "flat"]
+
+
+def test_map_mode_follows_settings_and_persists(win):
+    w, rec = win
+    w.settings_page.globe.setChecked(True)
+    assert w.map.mode == "globe" and guicfg.load().map_mode == "globe"
+    w.map.repaint()
+    QTest.mouseClick(w.map, Qt.LeftButton, Qt.NoModifier, w.map._mode_rect.center().toPoint())
+    assert w.map.mode == "flat" and guicfg.load().map_mode == "flat" and not w.settings_page.globe.isChecked()

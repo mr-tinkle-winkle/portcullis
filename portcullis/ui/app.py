@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from ..ui_kit import set_settings_provider
 from . import config as guicfg
 from .notifier import Notifier
+from . import update
 from .window import MainWindow
 
 
@@ -41,14 +42,57 @@ def _server_name() -> str:
     return f"portcullis-gui-{os.getuid()}"
 
 
-def run(hidden: bool = False, argv: "list[str] | None" = None) -> int:
-    # An already-running window just comes to the front.
+def read_message(sock, timeout_ms: int = 500) -> str:
+    """One newline-terminated message (bytes can arrive in pieces); without a newline, whatever came in time."""
+    import time
+    buf, end = b"", time.monotonic() + timeout_ms / 1000
+    while b"\n" not in buf and time.monotonic() < end:
+        if sock.bytesAvailable() or sock.waitForReadyRead(50):
+            buf += bytes(sock.readAll())
+    return buf.decode(errors="replace").strip()
+
+
+def _hand_over(hidden: bool) -> bool:
+    """Talk to an already-running window.  Returns True when it took the request (this process should exit).
+
+    Protocol: ``show|ping <build>``.  A window of the *same* build answers ``ok`` (and comes to the front for
+    ``show``); a window of a *different* build answers ``bye`` and quits, so this newer process takes over.  A
+    window too old to answer gets the plain ``show`` it understands."""
     probe = QLocalSocket()
     probe.connectToServer(_server_name())
-    if probe.waitForConnected(300):
-        probe.write(b"show" if not hidden else b"ping")
-        probe.flush()
-        probe.waitForBytesWritten(300)
+    if not probe.waitForConnected(300):
+        return False
+    verb = "ping" if hidden else "show"
+    probe.write(f"{verb} {update.build_id()}\n".encode())
+    probe.flush()
+    probe.waitForBytesWritten(300)
+    reply = read_message(probe, 800)
+    probe.disconnectFromServer()
+    if reply == "ok":
+        return True
+    if reply == "bye":
+        for _ in range(50):                                   # wait for it to let go of the name
+            again = QLocalSocket()
+            again.connectToServer(_server_name())
+            if not again.waitForConnected(100):
+                return False
+            again.disconnectFromServer()
+            import time
+            time.sleep(0.1)
+        return False
+    old = QLocalSocket()                                      # an old window: just bring it up, like before
+    old.connectToServer(_server_name())
+    if not old.waitForConnected(300):
+        return False                                          # it went away meanwhile: start normally
+    old.write(b"show" if not hidden else b"ping")
+    old.flush()
+    old.waitForBytesWritten(300)
+    return True
+
+
+def run(hidden: bool = False, argv: "list[str] | None" = None) -> int:
+    # An already-running window of this build just comes to the front; an older build steps aside.
+    if _hand_over(hidden):
         return 0
 
     set_settings_provider(lambda: guicfg.load_readonly().theme)      # cached: the kit calls this constantly
@@ -66,10 +110,30 @@ def run(hidden: bool = False, argv: "list[str] | None" = None) -> int:
 
     def on_conn():
         sock = server.nextPendingConnection()
-        sock.waitForReadyRead(200)
-        if bytes(sock.readAll()).strip() == b"show":
+        verb, _, build = read_message(sock).partition(" ")
+        if build and build != update.build_id():             # a different (newer) build started: let it take over
+            sock.write(b"bye\n")
+            sock.flush()
+            sock.waitForBytesWritten(300)
+            server.close()
+            app.quit()
+            return
+        sock.write(b"ok\n")
+        sock.flush()
+        sock.waitForBytesWritten(300)
+        if verb == "show":
             window.present()
     server.newConnection.connect(on_conn)
+
+    def relaunch(exe: str) -> None:
+        """Become the newly installed build (same process id, so a systemd user service keeps tracking it)."""
+        window.shutdown()
+        server.close()
+        if tray is not None:
+            tray.hide()
+        args = [exe, "gui"] + ([] if window.isVisible() else ["--hidden"])
+        os.execv(exe, args)
+    window.relaunch = relaunch
 
     tray = None
     if QSystemTrayIcon.isSystemTrayAvailable():

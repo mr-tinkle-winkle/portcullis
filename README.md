@@ -64,6 +64,15 @@ double-click to reset); Settings -> Map has the same switch. Drag the gaps betwe
 connection panel to **resize** them (remembered). The **eye** next to an app or a single connection hides it from
 the map (for streaming); hidden apps also leave the list unless you click "Show N hidden apps".
 
+**Updates**: after `nixos-rebuild switch` the window notices the new build within ~10 s: in the tray it
+restarts itself into it; with the window open, the banner offers "Restart window". Launching `portcullis gui`
+while an older build is running makes the old one step aside. (Builds before 0.3.1 don't know this yet: quit that
+one from the tray once.)
+
+**Connections that already existed** when the service started (e.g. after a restart) are found through the socket
+table (`ss`, which needs no privileges) and stay marked open as long as the socket exists. That covers TCP;
+UDP flows that started before the service still only appear once they send a new flow.
+
 **Service down?** The red banner has a **Restart service** button (`systemctl restart portcullis.service`); the
 NixOS module adds a polkit rule so members of the `portcullis` group can do that without a password.
 
@@ -93,7 +102,7 @@ If the delay listener dies, packets are accepted (fail-open), never stranded.
 
 Also verified on a real kernel: ask-hold then allow, block-always, hold timeout drop, incoming ask, and
 per-address / per-port block rules in both directions, and named ports (disabled port drops only that port, protocol
-and direction are honoured, incoming listen ports). UI: 58 offscreen tests, including live round-trips to a
+and direction are honoured, incoming listen ports). UI: 63 offscreen tests, including live round-trips to a
 real control server, and rendered screenshots checked by eye.
 
 Verified on a real kernel in network namespaces (54 tests): blocking each direction independently,

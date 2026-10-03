@@ -516,3 +516,53 @@ def test_a_disabled_incoming_named_port_stops_what_the_app_listens_on(lab):
         lab.b_send(5).wait()
         t.join()
         assert result["received"] == expected, (spec, result)
+
+
+# -- connections that already exist (found through the socket table, not the packet path) ---------------------------
+def _ss_in(lab, name):
+    """ss inside a namespace, with a pure cgroup2 mount (so it can name the cgroups even on hybrid test hosts)."""
+    script = ("umount -l /sys/fs/cgroup 2>/dev/null; mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; "
+              "ss -H -tunaO --cgroup")
+    r = sh(*ns(name), "unshare", "-m", "sh", "-c", script)
+    return r.stdout
+
+
+def test_existing_tcp_connections_are_found_with_their_app_and_direction(lab):
+    from portcullis import flows
+    from portcullis.appid import AppCgroup
+    if not shutil.which("ss"):
+        pytest.skip("no ss")
+    scope = lab.make_scope("app-pttest-222.scope")
+    rel = os.path.relpath(scope, lab.root)
+    app = AppCgroup("app-pttest-222.scope", rel, "app:pttest")
+    srv = subprocess.Popen([*ns(lab.b), sys.executable, "-c",          # a server in B that keeps the connection
+                            "import socket,time\ns=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                            "s.bind(('0.0.0.0',9100)); s.listen(5); c,_=s.accept(); time.sleep(6)"])
+    time.sleep(0.4)
+    code = textwrap.dedent(f"""
+        import os, socket, time
+        open(os.path.join({scope!r}, "cgroup.procs"), "w").write(str(os.getpid()))
+        out = socket.create_connection(({B_ADDR!r}, 9100))         # app -> B   (outgoing)
+        lst = socket.socket(); lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lst.bind(("0.0.0.0", 9200)); lst.listen(5)
+        print("ready", flush=True)
+        conn, _ = lst.accept()                                       # B -> app   (incoming)
+        time.sleep(4)
+    """)
+    p = subprocess.Popen([*ns(lab.a), sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    assert p.stdout.readline().strip() == "ready"
+    peer = subprocess.Popen([*ns(lab.b), sys.executable, "-c",
+                             f"import socket,time; s=socket.create_connection(('{A_ADDR}',9200)); time.sleep(4)"])
+    time.sleep(1.0)
+    found = flows.socket_flows(flows.parse_ss(_ss_in(lab, lab.a)), [app])
+    p.kill(); peer.kill(); srv.kill()
+    by_dir = {(d, rip, rport if d == "out" else lport) for _, _, d, proto, rip, rport, lport in found if proto == "tcp"}
+    assert ("out", B_ADDR, 9100) in by_dir, found
+    assert ("in", B_ADDR, 9200) in by_dir, found
+    assert all(i == "app:pttest" for i, *_ in found)
+    # and the table shows them as open connections of that app, although no packet was ever queued
+    t = flows.FlowTable()
+    t.observe(found)
+    t.refresh_open(None)
+    rem = {(r["ip"], r["direction"]): r for r in t.remotes("app:pttest")}
+    assert rem[(B_ADDR, "out")]["active"] and rem[(B_ADDR, "in")]["active"]

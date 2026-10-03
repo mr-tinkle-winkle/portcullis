@@ -5,7 +5,7 @@ import logging
 import signal
 import threading
 
-from . import appid, ask, ipc, rules
+from . import appid, ask, flows, ipc, rules
 from .engine import Engine
 from .flowqueue import FlowService
 from .flows import FlowTable, parse_conntrack
@@ -107,6 +107,16 @@ def read_conntrack() -> "set | None":
         return None
 
 
+def read_sockets() -> "list | None":
+    """Every TCP/UDP socket with its cgroup, via ``ss`` (sock_diag; needs no privileges).  None if ss is missing."""
+    import subprocess
+    try:
+        r = subprocess.run(["ss", "-H", "-tunaO", "--cgroup"], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return flows.parse_ss(r.stdout) if r.returncode == 0 else None
+
+
 def run() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     store, settings = ProfileStore(), SettingsStore()
@@ -141,6 +151,9 @@ def run() -> int:
         while not stop.is_set():
             try:
                 engine.step()
+                socks = read_sockets() if settings.get().track_flows else None
+                if socks is not None:
+                    table.observe(flows.socket_flows(socks, engine.current_apps()))
                 table.refresh_open(read_conntrack())
             except Exception:  # noqa: BLE001 -- one bad pass must not kill the service
                 logger.exception("pass failed")

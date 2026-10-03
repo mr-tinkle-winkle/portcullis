@@ -38,7 +38,7 @@
         in
         python.pkgs.buildPythonApplication {
           pname = "portcullis";
-          version = "0.3.0";
+          version = "0.3.1";
           format = "pyproject";
           src = ./.;
 
@@ -67,7 +67,7 @@
           postFixup = ''
             wrapQtApp "$out/bin/portcullis"
             wrapProgram "$out/bin/portcullis" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nftables pkgs.systemd pkgs.coreutils ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nftables pkgs.systemd pkgs.coreutils pkgs.iproute2 ]}
 
             mkdir -p "$out/share/applications"
             printf '%s\n' \

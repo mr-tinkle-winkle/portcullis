@@ -93,6 +93,73 @@ def parse_conntrack(text: str) -> "set[tuple[str, str, int, int]]":
     return out
 
 
+@dataclass(frozen=True)
+class Sock:
+    proto: str
+    state: str
+    lip: str
+    lport: int
+    rip: str
+    rport: int
+    cgroup: str             # path relative to the cgroup2 root, without the leading "/"
+
+
+def _split_addr(text: str) -> "tuple[str, int]":
+    host, _, port = text.rpartition(":")
+    host = host.strip("[]").split("%")[0]
+    return host, (int(port) if port.isdigit() else 0)
+
+
+def parse_ss(text: str) -> "list[Sock]":
+    """``ss -H -tunaO --cgroup`` -> sockets with the cgroup that owns each (works without root)."""
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or parts[0] not in ("tcp", "udp"):
+            continue
+        cg = next((p[7:] for p in parts[6:] if p.startswith("cgroup:")), None)
+        if cg is None:
+            continue
+        lip, lport = _split_addr(parts[4])
+        rip, rport = _split_addr(parts[5])
+        out.append(Sock(parts[0], parts[1], lip, lport, rip, rport, cg.strip("/")))
+    return out
+
+
+def _real_remote(ip: str) -> bool:
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (a.is_unspecified or a.is_loopback or a.is_multicast)
+
+
+def socket_flows(socks: "list[Sock]", apps) -> "list[tuple]":
+    """Connected sockets of the given apps as (identity, unit, direction, proto, rip, rport, lport).
+
+    ``apps`` are appid.AppCgroup-like (``relpath``, ``unit``, ``identity``).  A TCP connection whose local port the
+    same app is listening on came in ("in"); everything else the app opened ("out")."""
+    by_path = sorted(((a.relpath.strip("/"), a) for a in apps), key=lambda x: -len(x[0]))
+
+    def owner(cg: str):
+        for path, a in by_path:
+            if cg == path or cg.startswith(path + "/"):
+                return a
+        return None
+
+    listening = {(s.cgroup, s.proto, s.lport) for s in socks if s.state == "LISTEN"}
+    out = []
+    for s in socks:
+        if s.state in ("LISTEN", "TIME-WAIT", "CLOSE-WAIT", "LAST-ACK", "CLOSING") or not s.rport or not _real_remote(s.rip):
+            continue
+        a = owner(s.cgroup)
+        if a is None:
+            continue
+        direction = "in" if s.proto == "tcp" and (s.cgroup, "tcp", s.lport) in listening else "out"
+        out.append((a.identity, a.unit, direction, s.proto, s.rip, s.rport, s.lport))
+    return out
+
+
 class FlowTable:
     """Per-app record of remote endpoints, fed by ``record`` and refreshed by ``refresh_open``."""
 
@@ -102,6 +169,8 @@ class FlowTable:
         # identity -> {(direction, proto, rip, rport, lport): [first, last, count, unit]}
         self._apps: dict = {}
         self._open: "set | None" = None
+        self._sock_open: set = set()
+        self._sock_known: set = set()        # flows the socket table has shown: their open state is exact
 
     def record(self, identity: str, unit: str, direction: str, proto: str, rip: str, rport: int, lport: int) -> None:
         now = self._clock()
@@ -116,10 +185,35 @@ class FlowTable:
             else:
                 e[1], e[2], e[3] = now, e[2] + 1, unit
 
+    def observe(self, flows: "list[tuple]") -> None:
+        """Connections that exist right now (from the socket table): added if new -- including ones that were
+        already open before the service started, which the packet path never sees -- and kept fresh."""
+        now = self._clock()
+        with self.lock:
+            seen = set()
+            for identity, unit, direction, proto, rip, rport, lport in flows:
+                app = self._apps.setdefault(identity, {})
+                key = (direction, proto, rip, rport, lport)
+                e = app.get(key)
+                if e is None:
+                    # the same flow may already be known the other way round (e.g. from a queued packet)
+                    other = ("out" if direction == "in" else "in", proto, rip, rport, lport)
+                    if other in app:
+                        app[other][1], app[other][3] = now, unit
+                    else:
+                        app[key] = [now, now, 1, unit]
+                else:
+                    e[1], e[3] = now, unit
+                seen.add((proto, rip, rport, lport))
+            self._sock_open = seen
+            self._sock_known |= seen
+            if len(self._sock_known) > MAX_TUPLES * 2:
+                self._sock_known = set(seen)
+
     def refresh_open(self, open_set: "set | None") -> None:
         """``open_set`` from parse_conntrack, or None when conntrack can't be read."""
         with self.lock:
-            self._open = open_set
+            self._open = None if open_set is None else (open_set | self._sock_open)
             if open_set is not None:
                 now = self._clock()
                 for app in self._apps.values():
@@ -149,11 +243,19 @@ class FlowTable:
         with self.lock:
             app = dict(self._apps.get(identity, {}))
             opened = self._open
+            sock_open = set(self._sock_open)
+            sock_known = set(self._sock_known)
         grouped: dict = {}
         for (d, proto, rip, rport, lport), (first, last, count, unit) in app.items():
             g = grouped.setdefault((rip, d), {"ip": rip, "direction": d, "first": first, "last": last, "count": 0,
                                               "active": False, "ports": {}, "units": set()})
-            is_open = ((proto, rip, rport, lport) in opened) if opened is not None else (now - last < recent)
+            k = (proto, rip, rport, lport)
+            if opened is not None:
+                is_open = k in opened
+            elif k in sock_known:
+                is_open = k in sock_open
+            else:
+                is_open = now - last < recent
             g["first"], g["last"] = min(g["first"], first), max(g["last"], last)
             g["count"] += count
             g["active"] = g["active"] or is_open

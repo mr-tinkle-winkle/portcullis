@@ -938,3 +938,116 @@ def test_map_mode_follows_settings_and_persists(win):
     w.map.repaint()
     QTest.mouseClick(w.map, Qt.LeftButton, Qt.NoModifier, w.map._mode_rect.center().toPoint())
     assert w.map.mode == "flat" and guicfg.load().map_mode == "flat" and not w.settings_page.globe.isChecked()
+
+
+# -- picking up updates and a newly installed location database --------------------------------------------------------
+def test_build_root_and_newer_exe(tmp_path):
+    from portcullis.ui import update
+    assert update.build_root("/nix/store/abc-portcullis-0.3.0/lib/python3.14/site-packages/portcullis/__init__.py") == \
+        "/nix/store/abc-portcullis-0.3.0"
+    assert update.build_root(str(tmp_path / "x.py")) is None
+    old, new = "/nix/store/aaa-portcullis-0.3.0", "/nix/store/bbb-portcullis-0.3.1/bin/portcullis"
+    assert update.newer_exe(current=old, installed=new) == new
+    assert update.newer_exe(current=old, installed="/nix/store/aaa-portcullis-0.3.0/bin/portcullis") is None
+    assert update.newer_exe(current="", installed=new) is None               # not a nix install: never
+    assert update.newer_exe(current=old, installed="") is None
+
+
+def _upd_window(qapp, tmp_path, monkeypatch, newer):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from portcullis.ui.window import MainWindow
+    rec = Recorder(overview())
+    w = MainWindow(bridge=Bridge(request=rec), geo=FakeGeo(), cfg=guicfg.load(), poll_ms=10 ** 6,
+                   notifier=Notifier(FakeBackend()), newer_exe=lambda: newer[0])
+    calls = []
+    w.relaunch = calls.append
+    _KEEP.append(w)                    # (a window freed while its bridge thread still answers would crash Qt)
+    wait(200)
+    return w, calls
+
+
+_KEEP: list = []
+
+
+def test_a_hidden_window_switches_to_a_new_build_by_itself(qapp, tmp_path, monkeypatch):
+    newer = [None]
+    w, calls = _upd_window(qapp, tmp_path, monkeypatch, newer)
+    w.check_for_update()
+    assert calls == []
+    newer[0] = "/nix/store/bbb-portcullis/bin/portcullis"
+    w.check_for_update()                                          # not visible (tray mode)
+    assert calls == ["/nix/store/bbb-portcullis/bin/portcullis"]
+    w.shutdown()
+
+
+def test_a_visible_window_offers_the_restart_instead(qapp, tmp_path, monkeypatch):
+    newer = ["/nix/store/bbb-portcullis/bin/portcullis"]
+    w, calls = _upd_window(qapp, tmp_path, monkeypatch, newer)
+    w.show()
+    wait(300)
+    w.check_for_update()
+    assert calls == [] and w.banner.update_btn.isVisible() and "updated" in w.banner.label.text()
+    w.banner.update_btn.click()
+    assert calls == ["/nix/store/bbb-portcullis/bin/portcullis"]
+    w.shutdown()
+
+
+def test_the_running_window_steps_aside_for_a_different_build(qapp, tmp_path, monkeypatch):
+    """The single-instance handshake, with two real sockets: same build -> 'ok', other build -> 'bye'."""
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    from portcullis.ui import app as appmod, update
+    name = f"pt-test-{__import__('os').getpid()}"
+    monkeypatch.setattr(appmod, "_server_name", lambda: name)
+    srv = QLocalServer()
+    QLocalServer.removeServer(name)
+    assert srv.listen(name)
+    got = []
+
+    def on_conn():
+        sock = srv.nextPendingConnection()
+        verb, _, build = appmod.read_message(sock).partition(" ")
+        got.append((verb, build))
+        sock.write(b"ok\n" if build == "same" else b"bye\n")
+        sock.flush()
+        sock.waitForBytesWritten(300)
+        if build != "same":
+            srv.close()
+    srv.newConnection.connect(on_conn)
+    import subprocess, sys
+
+    def client(build, hidden):                                    # a separate process, like a real second launch
+        code = (f"import sys; sys.path[:0]={sys.path!r}\n"
+                "from portcullis.ui import app, update\n"
+                f"app._server_name = lambda: {name!r}\n"
+                f"update.build_id = lambda: {build!r}\n"
+                f"print(app._hand_over({hidden!r}))\n")
+        p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True,
+                             env={**__import__("os").environ, "QT_QPA_PLATFORM": "offscreen"})
+        while p.poll() is None:
+            wait(20)
+        return p.stdout.read().strip()
+
+    assert client("same", False) == "True" and got[-1] == ("show", "same")     # same build: it shows itself, we exit
+    assert client("newer", True) == "False" and got[-1] == ("ping", "newer")   # different build: it quit, we take over
+
+
+def test_a_location_database_installed_elsewhere_is_picked_up(qapp, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from portcullis.ui.window import MainWindow
+    reloads = []
+
+    class LateGeo(FakeGeo):
+        available = False
+        _mtime = 0
+
+        def reload(self):
+            reloads.append(1)
+            self.available, self._mtime = True, 5
+    g = LateGeo()
+    w = MainWindow(bridge=Bridge(request=Recorder(overview())), geo=g, cfg=guicfg.load(), poll_ms=10 ** 6)
+    _KEEP.append(w)
+    wait(200)
+    w._geo_checked = 0.0
+    w.on_overview(overview())
+    assert reloads and g.available and "installed" in w.settings_page.geo_status.text()
+    w.shutdown()

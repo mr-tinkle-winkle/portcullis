@@ -387,3 +387,64 @@ def test_overview_lists_apps_remotes_rules_and_settings(feng):
     sober = next(a for a in ov["apps"] if a["identity"] == "flatpak:org.vinegarhq.Sober")
     assert sober["profile"] is None and "settings" not in sober
     assert ov["settings"]["track_flows"] is True and ov["pending"] == []
+
+
+# -- the socket table (ss) ----------------------------------------------------------------------------------------------
+SS = """tcp ESTAB 0 0 192.168.1.20:51644 160.79.104.10:443 cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.vinegarhq.Sober-123.scope
+tcp ESTAB 0 0 192.168.1.20:7777 5.6.7.8:40000 cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.vinegarhq.Sober-123.scope/sub
+tcp LISTEN 0 128 0.0.0.0:7777 0.0.0.0:* cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.vinegarhq.Sober-123.scope/sub
+tcp ESTAB 0 0 [2001:db8::5]:40100 [2606:4700::1]:443 cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-9.scope
+udp ESTAB 0 0 192.168.1.20%wlan0:5353 224.0.0.251:5353 cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-9.scope
+tcp ESTAB 0 0 127.0.0.1:5000 127.0.0.1:41000 cgroup:/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-9.scope
+tcp TIME-WAIT 0 0 192.168.1.20:5 9.9.9.9:443
+tcp ESTAB 0 0 192.168.1.20:6000 1.2.3.4:443 cgroup:/system.slice/sshd.service
+garbage line
+"""
+
+
+class _A:
+    def __init__(self, unit, relpath, identity):
+        self.unit, self.relpath, self.identity = unit, relpath, identity
+
+
+def test_parse_ss_reads_addresses_ports_and_cgroups():
+    socks = flows.parse_ss(SS)
+    assert len(socks) == 7                                         # the TIME-WAIT line has no cgroup, garbage skipped
+    v6 = next(s for s in socks if ":" in s.rip)
+    assert (v6.lip, v6.lport, v6.rip, v6.rport) == ("2001:db8::5", 40100, "2606:4700::1", 443)
+    mdns = next(s for s in socks if s.proto == "udp")
+    assert mdns.lip == "192.168.1.20" and mdns.cgroup.endswith("app-firefox-9.scope")
+
+
+def test_socket_flows_match_apps_by_cgroup_and_work_out_the_direction():
+    base = "user.slice/user-1000.slice/user@1000.service/app.slice/"
+    apps = [_A("app-flatpak-org.vinegarhq.Sober-123.scope", base + "app-flatpak-org.vinegarhq.Sober-123.scope", "flatpak:org.vinegarhq.Sober"),
+            _A("app-firefox-9.scope", base + "app-firefox-9.scope", "app:firefox")]
+    got = flows.socket_flows(flows.parse_ss(SS), apps)
+    assert ("flatpak:org.vinegarhq.Sober", "app-flatpak-org.vinegarhq.Sober-123.scope", "out", "tcp", "160.79.104.10", 443, 51644) in got
+    assert ("flatpak:org.vinegarhq.Sober", "app-flatpak-org.vinegarhq.Sober-123.scope", "in", "tcp", "5.6.7.8", 40000, 7777) in got
+    assert ("app:firefox", "app-firefox-9.scope", "out", "tcp", "2606:4700::1", 443, 40100) in got
+    assert not [g for g in got if g[4] in ("127.0.0.1", "224.0.0.251", "1.2.3.4")]     # loopback, multicast, not an app
+
+
+def test_observe_adds_connections_that_predate_the_service_and_keeps_them_open():
+    now = [1000.0]
+    t = flows.FlowTable(clock=lambda: now[0])
+    t.record("app:x", "u", "out", "udp", "9.9.9.9", 53, 4000)          # seen through the packet path
+    t.observe([("app:x", "u", "out", "tcp", "1.1.1.1", 443, 5000),
+               ("app:x", "u", "in", "udp", "9.9.9.9", 53, 4000)])     # same flow, other way round: not doubled
+    t.refresh_open(None)
+    rem = {r["ip"]: r for r in t.remotes("app:x")}
+    assert set(rem) == {"1.1.1.1", "9.9.9.9"} and rem["1.1.1.1"]["active"] and rem["1.1.1.1"]["direction"] == "out"
+    now[0] += 120                                                      # long after: still open while the socket exists
+    t.observe([("app:x", "u", "out", "tcp", "1.1.1.1", 443, 5000)])
+    t.refresh_open(None)
+    rem = {r["ip"]: r for r in t.remotes("app:x")}
+    assert rem["1.1.1.1"]["active"] and not rem["9.9.9.9"]["active"]
+    t.observe([])                                                      # socket gone
+    t.refresh_open(None)
+    assert not {r["ip"]: r for r in t.remotes("app:x")}["1.1.1.1"]["active"]
+    # with conntrack readable, sockets still count as open
+    t.observe([("app:x", "u", "out", "tcp", "1.1.1.1", 443, 5000)])
+    t.refresh_open(set())
+    assert {r["ip"]: r for r in t.remotes("app:x")}["1.1.1.1"]["active"]

@@ -155,6 +155,11 @@ class Engine:
                 self.flows.sync({})
 
     # -- views --------------------------------------------------------------------------------------------
+    def current_apps(self) -> list:
+        """The app cgroups found by the last pass (for matching sockets to apps)."""
+        with self.lock:
+            return list(self._apps)
+
     def apps(self) -> "list[dict]":
         with self.lock:
             apps = self._scan(self.v2root)

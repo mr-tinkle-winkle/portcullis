@@ -18,6 +18,7 @@ from .notifier import Notifier
 from .pages import Page, SettingsPage
 from .resolver import Resolver
 from .service import ServiceControl
+from . import update as updmod
 from .widgets import AppListPanel, Banner, DetailPanel, PendingPanel
 
 
@@ -66,7 +67,7 @@ class Splitter(QSplitter):
 class MainWindow(QMainWindow):
     def __init__(self, bridge: "Bridge | None" = None, geo: "geomod.Geo | None" = None, cfg=None,
                  notifier: "Notifier | None" = None, resolver: "Resolver | None" = None, poll_ms: int = 1000,
-                 downloader=None, service: "ServiceControl | None" = None):
+                 downloader=None, service: "ServiceControl | None" = None, newer_exe=None):
         super().__init__()
         self.setWindowTitle("Portcullis")
         self.cfg = cfg or guicfg.load()
@@ -77,6 +78,9 @@ class MainWindow(QMainWindow):
         self._download = downloader or geomod.update
         self.service = service or ServiceControl(self)
         self.service.finished.connect(self.on_service_restarted)
+        self._newer_exe = newer_exe or updmod.newer_exe       # () -> path of a newer installed build, or None
+        self.update_exe: "str | None" = None
+        self.relaunch = None                                  # set by app.run: exec into a new build
         self.apps: "list[model.AppView]" = []
         self.pending: list = []
         self.selected: "str | None" = None
@@ -164,6 +168,7 @@ class MainWindow(QMainWindow):
         self.detail.portRequested.connect(self.on_port)
         self.banner.reviewClicked.connect(self.show_pending)
         self.banner.restartClicked.connect(self.restart_service)
+        self.banner.updateClicked.connect(self.apply_update)
         self.pending_dialog.panel.decided.connect(self.decide)
         s = self.settings_page
         s.daemonSettingChanged.connect(lambda ch: self.bridge.send({"cmd": "settings", "changes": ch}, "settings"))
@@ -183,6 +188,9 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.bridge.poll)
         self.timer.start(poll_ms)
+        self.update_timer = QTimer(self)                      # after `nixos-rebuild switch`: pick up the new build
+        self.update_timer.timeout.connect(self.check_for_update)
+        self.update_timer.start(10_000)
         QTimer.singleShot(0, self.bridge.poll)
 
     # ---- layout ---------------------------------------------------------------------------------------------------
@@ -202,6 +210,7 @@ class MainWindow(QMainWindow):
 
     def shutdown(self) -> None:
         self.timer.stop()
+        self.update_timer.stop()
         self.bridge.close()
         self.resolver.close()
 
@@ -218,6 +227,7 @@ class MainWindow(QMainWindow):
     def on_overview(self, ov: dict) -> None:
         self._down_reason = ""
         self._last_ov = ov
+        self._maybe_reload_geo()
         self.pending = ov.get("pending", [])
         if self.cfg.resolve_hostnames:
             ips = [r["ip"] for a in ov.get("apps", []) for r in a.get("remotes", []) if not model.is_local_ip(r["ip"])]
@@ -252,8 +262,41 @@ class MainWindow(QMainWindow):
             self.banner.show_state("The firewall rules couldn't be applied: " + ov["error"].splitlines()[0], kind="off")
         elif ov.get("flow_errors"):
             self.banner.show_state("Connection tracking isn't working: " + next(iter(ov["flow_errors"].values())), kind="off")
+        elif self.update_exe:
+            self.banner.show_state("Portcullis was updated. Restart the window to use the new version.", update=True)
         else:
             self.banner.show_state("")
+
+    def _maybe_reload_geo(self) -> None:
+        """Pick up a location database installed by someone else (the CLI, another window) without a restart."""
+        import time
+        now = time.monotonic()
+        if now - getattr(self, "_geo_checked", 0.0) < 5.0:
+            return
+        self._geo_checked = now
+        before = (self.geo.available, getattr(self.geo, "_mtime", None))
+        self.geo.reload()
+        if (self.geo.available, getattr(self.geo, "_mtime", None)) != before:
+            self._sig = None
+            self.settings_page.set_geo_status(self.geo.available, geomod.age_days(self.geo.path))
+            self._update_hint()
+
+    # ---- updates ----------------------------------------------------------------------------------------------------
+    def check_for_update(self) -> None:
+        exe = self._newer_exe()
+        if not exe:
+            return
+        self.update_exe = exe
+        if not self.isVisible() and self.relaunch is not None:   # nobody is looking: just switch over
+            self.apply_update()
+        elif getattr(self, "_last_ov", None) is not None:
+            self._refresh_banner(self._last_ov)
+
+    def apply_update(self) -> None:
+        if self.update_exe and self.relaunch is not None:
+            self.cfg.win_w, self.cfg.win_h = self.width(), self.height()
+            guicfg.save(self.cfg)
+            self.relaunch(self.update_exe)
 
     def _update_hint(self) -> None:
         if not self.geo.available:

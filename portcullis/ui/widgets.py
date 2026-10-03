@@ -753,6 +753,7 @@ class Banner(QWidget):
     """The strip above the map: service down / questions waiting."""
     reviewClicked = Signal()
     restartClicked = Signal()
+    updateClicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -772,16 +773,23 @@ class Banner(QWidget):
         self.restart.clicked.connect(self.restartClicked)
         self.restart.hide()
         lay.addWidget(self.restart)
+        self.update_btn = CustomButton("Restart window")
+        self.update_btn.setToolTip("Reopen Portcullis on the newly installed version")
+        self.update_btn.clicked.connect(self.updateClicked)
+        self.update_btn.hide()
+        lay.addWidget(self.update_btn)
         self.setFixedHeight(46)
         self.hide()
 
-    def show_state(self, text: str, button: bool = False, kind: str = "special", restart: bool = False) -> None:
+    def show_state(self, text: str, button: bool = False, kind: str = "special", restart: bool = False,
+                   update: bool = False) -> None:
         """kind: 'special' (purple: needs you) or 'off' (red: something is broken)."""
         sig = palette.signals()
         self._fill = sig.off if kind == "off" else sig.special
         self.label.setText(text)
         self.button.setVisible(button)
         self.restart.setVisible(restart)
+        self.update_btn.setVisible(update)
         self.setVisible(bool(text))
         c = contrast_text(self._fill)
         self.label.setStyleSheet(f"QLabel {{ color: {c.name()}; }}")

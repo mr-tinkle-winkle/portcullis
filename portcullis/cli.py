@@ -9,7 +9,11 @@ portcullis -- per-app network gate.
     portcullis on|off|toggle NAME      # the master switch -- bind these to keys / a Stream Deck
     portcullis remove NAME
     portcullis launch NAME -- COMMAND  # start a command in its own app unit (so it can be matched)
-    portcullis gui | status | doctor | daemon
+    portcullis gui [--hidden] | status | doctor | daemon | geo-update | geo-status
+
+    portcullis --profile NAME [--blockIncoming] [--blockOutgoing] [--allowIncoming] [--allowOutgoing]
+                              [--toggleIncoming] [--toggleOutgoing]
+                              [--incomingLatency MS] [--outgoingLatency MS]
 """
 from __future__ import annotations
 
@@ -43,6 +47,9 @@ def describe(p: dict) -> str:
             bits.append(f"block {label}")
         elif p[f"delay_{d}_ms"]:
             bits.append(f"delay {label} {p[f'delay_{d}_ms']} ms")
+    off = [x["name"] for x in p.get("ports", []) if not x["enabled"]]
+    if off:
+        bits.append("ports off: " + ", ".join(off))
     return ", ".join(bits) or "no effect set"
 
 
@@ -85,8 +92,111 @@ def _flag(p: argparse.ArgumentParser, name: str, create: bool) -> None:
         p.add_argument(f"--{name}", dest=name.replace("-", "_"), choices=list(ONOFF), default=None)
 
 
+def parse_port_spec(text: str) -> dict:
+    """``voice=3478/udp@out`` -> a port spec (proto defaults to both, direction to both)."""
+    name, sep, rest = text.partition("=")
+    if not sep or not name.strip():
+        raise SystemExit(f"portcullis: --addPort wants NAME=PORT[/tcp|udp][@in|out], got {text!r}")
+    rest, _, direction = rest.partition("@")
+    num, _, proto = rest.partition("/")
+    if not num.strip().isdigit():
+        raise SystemExit(f"portcullis: {text!r}: the port must be a number")
+    return {"name": name.strip(), "port": int(num), "proto": proto.strip() or "both", "direction": direction.strip() or "both"}
+
+
+def _profile_main(argv: "list[str]") -> int:
+    """``portcullis --profile NAME --blockIncoming --outgoingLatency=250 ...``"""
+    p = argparse.ArgumentParser(
+        prog="portcullis", allow_abbrev=False,
+        description="Change one profile's blocking / latency in a single command.",
+        epilog="Latency 0 removes the delay.  Changing a profile that has an effect also switches it on.")
+    p.add_argument("--profile", required=True, metavar="NAME")
+    for flag, helptext in (("blockIncoming", "block incoming traffic"), ("blockOutgoing", "block outgoing traffic"),
+                           ("allowIncoming", "stop blocking incoming traffic"),
+                           ("allowOutgoing", "stop blocking outgoing traffic"),
+                           ("toggleIncoming", "flip the incoming block"), ("toggleOutgoing", "flip the outgoing block")):
+        p.add_argument(f"--{flag}", dest=flag, action="store_true", help=helptext)
+    p.add_argument("--incomingLatency", type=int, metavar="MS", help="fake latency on incoming traffic (0 = none)")
+    p.add_argument("--outgoingLatency", type=int, metavar="MS", help="fake latency on outgoing traffic (0 = none)")
+    p.add_argument("--addPort", action="append", default=[], metavar="NAME=PORT[/tcp|udp][@in|out]",
+                   help="name a port for this app, e.g. voice=3478/udp  or  host=7777/udp@in (repeatable)")
+    for flag, helptext in (("enablePort", "allow that port's traffic again"), ("disablePort", "block that port's traffic"),
+                           ("togglePort", "flip that port"), ("removePort", "forget that port")):
+        p.add_argument(f"--{flag}", action="append", default=[], metavar="NAME", help=f"{helptext} (name or number; repeatable)")
+    args = p.parse_args(argv)
+
+    changes: dict = {}
+    for d, word in (("in", "Incoming"), ("out", "Outgoing")):
+        wanted = [n for n in ("block", "allow", "toggle") if getattr(args, f"{n}{word}")]
+        if len(wanted) > 1:
+            raise SystemExit(f"portcullis: pick one of --block{word}, --allow{word}, --toggle{word}")
+        if wanted:
+            changes[f"block_{d}"] = {"block": True, "allow": False, "toggle": "toggle"}[wanted[0]]
+        ms = getattr(args, f"{word.lower()}Latency")
+        if ms is not None:
+            if not 0 <= ms <= 5000:
+                raise SystemExit(f"portcullis: --{word.lower()}Latency must be between 0 and 5000 ms")
+            changes[f"delay_{d}_ms"] = ms
+
+    def current() -> dict:
+        found = [x for x in _call({"cmd": "list"})["profiles"] if x["name"].lower() == args.profile.lower()]
+        if not found:
+            raise SystemExit(f"portcullis: no profile named {args.profile!r} "
+                             f"(create one: portcullis add {args.profile} --running APP)")
+        return found[0]
+
+    prof = current()
+    for text in args.addPort:
+        _call({"cmd": "port", "name": args.profile, "action": "add", "spec": parse_port_spec(text)})
+    for flag, action in (("enablePort", "enable"), ("disablePort", "disable"), ("togglePort", "toggle"),
+                         ("removePort", "remove")):
+        for pname in getattr(args, flag):
+            _call({"cmd": "port", "name": args.profile, "action": action, "port_name": pname})
+    if args.addPort or any(getattr(args, f) for f in ("enablePort", "disablePort", "togglePort", "removePort")):
+        prof = current()
+    if changes:
+        _call({"cmd": "set", "name": args.profile, "changes": changes})
+        prof = current()
+        if not prof["enabled"] and (any(prof[k] for k in ("block_in", "block_out", "delay_in_ms", "delay_out_ms"))
+                                    or any(not x["enabled"] for x in prof.get("ports", []))):
+            _call({"cmd": "set", "name": args.profile, "changes": {"enabled": True}})
+            prof = current()
+    print(f"{prof['name']}: {'ACTIVE' if prof['enabled'] else 'off'} - {describe(prof)}")
+    for x in prof.get("ports", []):
+        where = {"both": "in+out", "in": "incoming", "out": "outgoing"}[x["direction"]]
+        print(f"  port {x['name']}: {x['port']}/{x['proto']} {where} - {'enabled' if x['enabled'] else 'DISABLED (blocked)'}")
+    for d, word in (("in", "incoming"), ("out", "outgoing")):
+        if prof[f"block_{d}"] and prof[f"delay_{d}_ms"]:
+            print(f"  note: {word} is blocked, so its {prof[f'delay_{d}_ms']} ms latency has no effect", file=sys.stderr)
+    return 0
+
+
+def _geo_update() -> int:
+    from . import geo
+    dest = geo.db_path()
+    try:
+        used = geo.update(dest, progress=lambda m: print(m, flush=True))
+    except Exception as e:  # noqa: BLE001
+        print(f"geo-update failed: {e}", file=sys.stderr)
+        return 1
+    print(f"installed {used}\n{geo.ATTRIBUTION}")
+    return 0
+
+
+def _geo_status() -> int:
+    from . import geo
+    g = geo.Geo()
+    if not g.available:
+        print(f"no location database at {geo.db_path()} (run: portcullis geo-update)")
+        return 1
+    print(f"{geo.db_path()} ({geo.age_days()} days old)\n{geo.ATTRIBUTION}")
+    return 0
+
+
 def main(argv: "list[str] | None" = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if any(a == "--profile" or a.startswith("--profile=") for a in argv):
+        return _profile_main(argv)
     p = argparse.ArgumentParser(prog="portcullis", description="Block or delay an app's incoming / outgoing network traffic.")
     p.add_argument("--version", action="version", version=f"portcullis {__version__}")
     sub = p.add_subparsers(dest="cmd")
@@ -94,7 +204,10 @@ def main(argv: "list[str] | None" = None) -> int:
     sub.add_parser("apps", help="running apps and the profile covering each")
     sub.add_parser("status", help="profiles with live packet counters")
     sub.add_parser("doctor", help="check what this system supports")
-    sub.add_parser("gui", help="open the window")
+    g = sub.add_parser("gui", help="open the window")
+    g.add_argument("--hidden", action="store_true", help="start in the tray only (for autostart)")
+    sub.add_parser("geo-update", help="download the offline DB-IP City Lite location database")
+    sub.add_parser("geo-status", help="show whether the location database is installed")
     sub.add_parser("daemon", help="the system service")
 
     a = sub.add_parser("add", help="create a profile")
@@ -129,7 +242,11 @@ def main(argv: "list[str] | None" = None) -> int:
         return daemon.run()
     if cmd == "gui":
         from . import gui
-        return gui.run()
+        return gui.run(hidden=args.hidden)
+    if cmd == "geo-update":
+        return _geo_update()
+    if cmd == "geo-status":
+        return _geo_status()
     if cmd in ("list", "status"):
         st = _call({"cmd": "status"})
         _print_profiles(st["profiles"])

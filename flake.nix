@@ -56,6 +56,8 @@
 
           propagatedBuildInputs = [
             python.pkgs.pyside6
+            python.pkgs.maxminddb
+            python.pkgs.tomli-w
             netfilterqueue
           ];
 
@@ -101,6 +103,8 @@
             packages = [
               (pkgs.python3.withPackages (ps: [
                 ps.pyside6
+                ps.maxminddb
+                ps.tomli-w
                 (mkNetfilterQueue pkgs)
                 ps.pytest
                 ps.setuptools
@@ -145,6 +149,20 @@
               group = "portcullis";
             };
             users.users.${cfg.user}.extraGroups = [ "portcullis" ];
+
+            # The window lives in your session (tray icon + notifications for new connections).
+            systemd.user.services.portcullis-gui = {
+              description = "portcullis window / tray";
+              wantedBy = [ "graphical-session.target" ];
+              partOf = [ "graphical-session.target" ];
+              after = [ "graphical-session.target" ];
+              environment.PORTCULLIS_SOCKET = "/run/portcullis/control.sock";
+              serviceConfig = {
+                ExecStart = "${pkg}/bin/portcullis gui --hidden";
+                Restart = "on-failure";
+                RestartSec = 5;
+              };
+            };
 
             systemd.services.portcullis = {
               description = "portcullis: per-app network block / latency";

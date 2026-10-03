@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import threading
 
-from . import appid, rules
+from . import appid, decisions, flowqueue, rules
 from .delay import DelayQueue
 from .profiles import ProfileStore
+from .settings import Settings
 
 logger = logging.getLogger("portcullis.engine")
 
@@ -56,9 +57,15 @@ class QueueManager:
 
 class Engine:
     def __init__(self, store: ProfileStore, *, scan=appid.scan, apply=rules.apply_ruleset,
-                 queues: "QueueManager | None" = None, v2root: "str | None" = None, counters=rules.counters):
+                 queues: "QueueManager | None" = None, v2root: "str | None" = None, counters=rules.counters,
+                 flows=None, table=None, broker=None, settings=lambda: Settings()):
+        """``flows`` (a FlowService), ``table`` (FlowTable) and ``broker`` (ask.Broker) switch on the
+        connection tracking / ask mode; without them only blocking and delay run."""
         self.store = store
         self._scan, self._apply, self._counters = scan, apply, counters
+        self.flows, self.table, self.broker, self._settings = flows, table, broker, settings
+        self._flow_idx: "dict[str, int]" = {}
+        self._owner_name: "dict[str, str]" = {}        # identity -> name of the profile governing it
         self.queues = queues if queues is not None else QueueManager(store)
         self.v2root = v2root or appid.cgroup2_root()
         self.lock = threading.RLock()
@@ -68,31 +75,67 @@ class Engine:
         self._matches: "dict[str, list[appid.AppCgroup]]" = {}
 
     # -- matching ---------------------------------------------------------------------------------------
-    def _match(self, apps) -> "tuple[list[rules.Target], dict]":
+    def _match(self, apps) -> "tuple[list[rules.Target], dict, dict]":
+        """(block/delay targets, {profile name: [apps]}, {unit: governing profile})."""
         profiles = self.store.all()
         per_profile: dict = {p.name: [] for p in profiles}
-        targets = []
+        targets, owners = [], {}
         for app in apps:
-            claimed = False
-            for p in profiles:                         # the first *active* matching profile applies to an app
+            for p in profiles:             # the first *active* matching profile governs an app
                 if any(appid.matches(m, app) for m in p.match):
                     per_profile[p.name].append(app)
-                    if not claimed and p.enabled and p.has_effect():
-                        targets.append(rules.Target(app.unit, app.relpath, p))
-                        claimed = True
-        return targets, per_profile
+                    if app.unit not in owners and p.enabled and p.relevant():
+                        owners[app.unit] = p
+                        if p.has_effect() or p.port_blocks():
+                            targets.append(rules.Target(app.unit, app.relpath, p))
+        return targets, per_profile, owners
+
+    def owner_of(self, identity: str):
+        """The Profile governing an app identity right now (fresh from the store), or None."""
+        name = self._owner_name.get(identity)
+        return self.store.find(name) if name else None
+
+    def _alloc_idx(self, relpaths: "list[str]") -> None:
+        for rp in [r for r in self._flow_idx if r not in relpaths]:
+            del self._flow_idx[rp]
+        used = set(self._flow_idx.values())
+        for rp in relpaths:
+            if rp not in self._flow_idx:
+                i = next(i for i in range(flowqueue.MAX_APPS * 4) if i not in used)
+                self._flow_idx[rp], _ = i, used.add(i)
+
+    def _flow_targets(self, apps, owners) -> "tuple[list[rules.FlowTarget], dict]":
+        if self.flows is None:
+            return [], {}
+        s = self._settings()
+        chosen = [a for a in apps if s.track_flows or decisions.effective_ask(owners.get(a.unit), s)]
+        chosen = chosen[:flowqueue.MAX_APPS]
+        self._alloc_idx([a.relpath for a in chosen])
+        fts, wanted = [], {}
+        for a in chosen:
+            i = self._flow_idx[a.relpath]
+            owner = owners.get(a.unit)
+            blocks = tuple(r for r in (owner.rules if owner else []) if r["verdict"] == "block")
+            fts.append(rules.FlowTarget(a.unit, a.relpath, flowqueue.qnum(i, "in"), flowqueue.qnum(i, "out"), blocks))
+            for d in ("in", "out"):
+                wanted[flowqueue.qnum(i, d)] = flowqueue.FlowMeta(a.identity, a.unit, d)
+        return fts, wanted
 
     def step(self) -> bool:
         """One scan-and-apply pass; returns True if the ruleset changed."""
         with self.lock:
             apps = self._scan(self.v2root)
-            targets, per_profile = self._match(apps)
+            targets, per_profile, owners = self._match(apps)
             self._apps, self._matches = apps, per_profile
-            text = rules.build_ruleset(targets, self.v2root)
+            self._owner_name = {a.identity: owners[a.unit].name for a in apps if a.unit in owners}
+            fts, wanted_flows = self._flow_targets(apps, owners)
+            text = rules.build_ruleset(targets, self.v2root, fts)
             wanted = {(t.profile.qid, d) for t in targets for d in ("in", "out") if rules.verdict(t.profile, d) == "queue"}
             changed = False
             if text != self._last_text:
                 self.queues.ensure(wanted)             # listeners first, then the rules that feed them
+                if self.flows is not None:
+                    self.flows.sync(wanted_flows)
                 ok, err = self._apply(text)
                 if ok:
                     self._last_text, self.error, changed = text, "", True
@@ -108,12 +151,14 @@ class Engine:
             rules.remove_table()
             self._last_text = None
             self.queues.stop_all()
+            if self.flows is not None:
+                self.flows.sync({})
 
     # -- views --------------------------------------------------------------------------------------------
     def apps(self) -> "list[dict]":
         with self.lock:
             apps = self._scan(self.v2root)
-            _, per_profile = self._match(apps)
+            _, per_profile, _o = self._match(apps)
             owner: dict = {}
             for p in self.store.all():                           # first matching profile (in list order) is shown
                 for a in per_profile.get(p.name, []):
@@ -125,9 +170,70 @@ class Engine:
             counts = self._counters()
             profiles = []
             for p in self.store.all():
-                d = {k: getattr(p, k) for k in ("name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms")}
+                d = {k: getattr(p, k) for k in ("name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask", "rules", "ports")}
                 d["running"] = [a.unit for a in self._matches.get(p.name, [])]
                 d["counters"] = {dr: counts.get((p.qid, dr)) for dr in ("in", "out")}
                 profiles.append(d)
             return {"profiles": profiles, "error": self.error, "queue_errors": self.queues.errors(),
                     "held_packets": self.queues.held()}
+
+    def overview(self) -> dict:
+        """Everything the map UI draws, in one call: every app (running, with a profile, or recently
+        seen) with its settings, its remotes and what governs each of them."""
+        with self.lock:
+            s = self._settings()
+            apps = self._scan(self.v2root)
+            _, per_profile, owners = self._match(apps)
+            profiles = {p.name: p for p in self.store.all()}
+            by_identity: dict = {}
+            for a in apps:
+                d = by_identity.setdefault(a.identity, {"units": []})
+                d["units"].append(a.unit)
+            for p in profiles.values():
+                for m in p.match:
+                    if ":" in m and not m.lower().startswith("unit:"):
+                        by_identity.setdefault(m, {"units": []})
+            if self.table is not None:
+                for ident in self.table.identities():
+                    by_identity.setdefault(ident, {"units": []})
+            counts = self._counters()
+            out = []
+            for ident, d in sorted(by_identity.items()):
+                owner = None
+                for a in apps:
+                    if a.identity == ident and a.unit in owners:
+                        owner = owners[a.unit]
+                        break
+                if owner is None:
+                    owner = next((p for p in profiles.values() if ident in p.match and p.enabled), None) or \
+                        next((p for p in profiles.values() if ident in p.match), None)
+                rules_ = owner.rules if owner else []
+                ask = decisions.effective_ask(owner if owner and owner.enabled else None, s)
+                remotes = self.table.remotes(ident) if self.table is not None else []
+                for r in remotes:
+                    r["rule"] = decisions.rule_verdict(rules_, r["ip"], 0, "")
+                    for p in r["ports"]:
+                        p["rule"] = decisions.rule_verdict([x for x in rules_ if x["port"]], r["ip"], p["port"], p["proto"])
+                    r["blocked"] = r["rule"] == "block"
+                    r["temp_allowed"] = bool(self.broker and self.broker.temp.allowed(
+                        decisions.Temporary.key(ident, r["ip"], 0, "", False)))
+                seen = {r["ip"] for r in remotes}
+                for rule in rules_:                      # rules for remotes not seen lately stay visible (to undo them)
+                    if rule["ip"] not in seen and not rule["port"]:
+                        seen.add(rule["ip"])
+                        remotes.append({"ip": rule["ip"], "direction": "out", "first": 0, "last": 0, "count": 0,
+                                        "active": False, "ports": [], "units": [], "rule": rule["verdict"],
+                                        "blocked": rule["verdict"] == "block", "temp_allowed": False})
+                entry = {"identity": ident, "units": d["units"], "running": bool(d["units"]),
+                         "profile": owner.name if owner else None, "ask": ask, "remotes": remotes}
+                if owner:
+                    entry["settings"] = {k: getattr(owner, k) for k in
+                                         ("enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask")}
+                    entry["rules"] = owner.rules
+                    entry["ports"] = owner.ports
+                    entry["counters"] = {dr: counts.get((owner.qid, dr)) for dr in ("in", "out")}
+                out.append(entry)
+            return {"apps": out, "pending": self.broker.pending() if self.broker else [],
+                    "settings": vars(s), "error": self.error, "flow_errors": dict(self.flows.errors) if self.flows else {},
+                    "temp_allows": [{"key": list(k), "seconds": sec} for k, sec in
+                                    (self.broker.temp.allowed_list() if self.broker else [])]}

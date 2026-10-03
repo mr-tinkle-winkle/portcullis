@@ -265,3 +265,52 @@ def test_a_disabled_profile_does_not_shadow_a_later_enabled_one(eng):
     e.step()
     assert applied[-1].count("socket cgroupv2") == 1 and "drop" in applied[-1]
     assert "chain in" not in applied[-1]                                    # B (outgoing only) applies, not A
+
+
+# -- named ports ------------------------------------------------------------------------------------------
+def test_clean_port_validates_and_normalizes():
+    from portcullis import decisions
+    assert decisions.clean_port({"name": "  voice  chat ", "port": "3478", "proto": "UDP"}) == \
+        {"name": "voice chat", "port": 3478, "proto": "udp", "direction": "both", "enabled": True}
+    assert decisions.clean_port({"name": "x", "port": 1, "proto": "any"})["proto"] == "both"
+    for bad in ({"port": 5}, {"name": "x"}, {"name": "x", "port": 0}, {"name": "x", "port": 70000},
+                {"name": "x", "port": True}, {"name": "x", "port": 5, "proto": "icmp"},
+                {"name": "x", "port": 5, "direction": "up"}, {"name": "x", "port": 5, "enabled": "yes"}):
+        with pytest.raises(ValueError):
+            decisions.clean_port(bad)
+
+
+def test_port_actions_on_a_profile(tmp_path):
+    from portcullis.profiles import ProfileStore, StoreError
+    st = ProfileStore(tmp_path / "p.json")
+    p = st.add(name="game", match=["app:g"], enabled=True)
+    st.port_action(p, "add", spec={"name": "Voice", "port": 3478, "proto": "udp", "direction": "out"})
+    st.port_action(p, "add", spec={"name": "host", "port": 7777})
+    assert [x["enabled"] for x in p.ports] == [True, True]
+    st.port_action(p, "disable", "voice")                       # case-insensitive name
+    st.port_action(p, "toggle", "7777")                         # or the number
+    assert [x["enabled"] for x in p.ports] == [False, False]
+    st.port_action(p, "toggle", "host")
+    st.port_action(p, "enable", "Voice")
+    assert [x["enabled"] for x in p.ports] == [True, True] and p.port_blocks() == []
+    st.port_action(p, "add", spec={"name": "VOICE", "port": 3479})   # same name replaces
+    assert len(p.ports) == 2 and p.ports[-1]["port"] == 3479
+    with pytest.raises(StoreError):
+        st.port_action(p, "enable", "nope")
+    st.port_action(p, "remove", "host")
+    assert [x["name"] for x in p.ports] == ["VOICE"]
+    assert ProfileStore(tmp_path / "p.json").find("game").ports == p.ports        # persisted
+
+
+def test_disabled_ports_become_drop_rules_in_the_right_chains(tmp_path):
+    from portcullis.profiles import Profile
+    prof = Profile(name="g", qid=3, enabled=True, ports=[
+        {"name": "a", "port": 3478, "proto": "udp", "direction": "out", "enabled": False},
+        {"name": "b", "port": 7777, "proto": "both", "direction": "in", "enabled": False},
+        {"name": "c", "port": 1111, "proto": "tcp", "direction": "both", "enabled": True}]).sanitize()
+    text = rules.build_ruleset([rules.Target("app-x.scope", "a/b/app-x.scope", prof)], "/sys/fs/cgroup")
+    out_chain, in_chain = text.split("chain in ")[0], text.split("chain in ")[1]
+    assert "meta l4proto udp th dport 3478 counter drop" in out_chain and "th sport 3478" in out_chain
+    assert "7777" not in out_chain and "3478" not in in_chain
+    assert "meta l4proto { tcp, udp } th dport 7777 counter drop" in in_chain
+    assert "1111" not in text                                    # enabled ports emit nothing

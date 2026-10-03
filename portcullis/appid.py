@@ -51,6 +51,13 @@ def identity(unit: str) -> "str | None":
     return "app:" + re.sub(r"(@[0-9a-fA-F]+|-\d+)$", "", rest)
 
 
+def pretty_name(identity: str) -> str:
+    """A short human name for an identity: flatpak:org.vinegarhq.Sober -> Sober, app:firefox -> firefox."""
+    kind, _, rest = identity.partition(":")
+    name = rest.rsplit(".", 1)[-1] if kind == "flatpak" and "." in rest else rest
+    return name or identity
+
+
 @dataclass(frozen=True)
 class AppCgroup:
     unit: str

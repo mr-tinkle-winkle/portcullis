@@ -329,3 +329,190 @@ def test_stopping_the_queue_releases_held_packets(queued):
     info = json.loads(helper.communicate()[0])
     got = json.loads(rx.communicate()[0])
     assert info["released"]["2000"] == 4 and len(got) == 4                        # flushed at shutdown, none dropped
+
+
+# ---- connection tracking + ask mode (FlowService/Broker on real NFQUEUE traffic) ---------------------------------------
+# The nft `queue` statement can't be loaded on every kernel (this sandbox's lacks NFT_QUEUE), so the listener is fed by
+# iptables NFQUEUE rules here -- the same queue protocol, the same listener code.
+FLOW_HELPER = os.path.join(os.path.dirname(__file__), "flow_helper.py")
+
+
+@pytest.fixture
+def flowlab(lab):
+    for chain, qn in (("OUTPUT", "2100"), ("INPUT", "2101")):
+        _iptables(lab, "-A", chain, "-p", "tcp", "-m", "conntrack", "--ctstate", "NEW", "-j", "NFQUEUE",
+                  "--queue-num", qn, "--queue-bypass")
+    return lab
+
+
+def run_flow_helper(lab, seconds, mode, hold=20):
+    env = {**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(__file__))}
+    p = subprocess.Popen([*ns(lab.a), sys.executable, FLOW_HELPER, str(seconds), mode, str(hold)],
+                         stdout=subprocess.PIPE, text=True, env=env)
+    time.sleep(1.0)
+    return p
+
+
+def tcp_server_in(lab, name, port, seconds):
+    code = (f"import socket,time\ns=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            f"s.bind(('0.0.0.0',{port})); s.listen(5); s.settimeout(0.2); end=time.time()+{seconds}\n"
+            f"while time.time()<end:\n try: c,_=s.accept(); c.close()\n except socket.timeout: pass\n")
+    p = subprocess.Popen([*ns(name), sys.executable, "-c", code])
+    time.sleep(0.4)
+    return p
+
+
+def tcp_connect_from(lab, name, dest, port, timeout=6.0):
+    code = (f"import socket,time,json\nt=time.time(); s=socket.socket(); s.settimeout({timeout})\n"
+            f"try:\n s.connect(('{dest}',{port})); ok=True\nexcept OSError: ok=False\n"
+            f"print(json.dumps({{'ok':ok,'secs':round(time.time()-t,2)}}))\n")
+    r = sh(*ns(name), sys.executable, "-c", code)
+    return json.loads(r.stdout)
+
+
+def test_observe_mode_records_connections_without_getting_in_the_way(flowlab):
+    helper = run_flow_helper(flowlab, 4.0, "observe")
+    srv = tcp_server_in(flowlab, flowlab.b, 9100, 3.0)
+    res = tcp_connect_from(flowlab, flowlab.a, B_ADDR, 9100)
+    srv.wait()
+    out = json.loads(helper.communicate()[0])
+    assert res["ok"] and res["secs"] < 1.0
+    assert out["errors"] == {}, out
+    assert out["remotes"] == [{"ip": B_ADDR, "direction": "out", "count": 1, "ports": [9100]}], out
+
+
+def test_ask_mode_holds_a_new_outgoing_connection_until_allowed(flowlab):
+    helper = run_flow_helper(flowlab, 5.0, "ask:allow_always:1.0")
+    srv = tcp_server_in(flowlab, flowlab.b, 9100, 4.0)
+    res = tcp_connect_from(flowlab, flowlab.a, B_ADDR, 9100)
+    out = json.loads(helper.communicate()[0])
+    srv.wait()
+    assert res["ok"] and 0.9 <= res["secs"] <= 3.0, res                      # waited for the answer, then went through
+    assert out["asked"] == [{"direction": "out", "ip": B_ADDR, "port": 0}]
+    assert out["rules"] == [{"ip": B_ADDR, "port": 0, "proto": "", "verdict": "allow"}]
+
+
+def test_ask_mode_block_always_refuses_the_connection(flowlab):
+    helper = run_flow_helper(flowlab, 5.0, "ask:block_always:0.5")
+    srv = tcp_server_in(flowlab, flowlab.b, 9100, 4.0)
+    res = tcp_connect_from(flowlab, flowlab.a, B_ADDR, 9100, timeout=3.0)
+    out = json.loads(helper.communicate()[0])
+    srv.wait()
+    assert not res["ok"], res
+    assert out["rules"][0]["verdict"] == "block"
+
+
+def test_an_unanswered_question_times_out_and_drops(flowlab):
+    helper = run_flow_helper(flowlab, 7.0, "ask:none", hold=3)
+    srv = tcp_server_in(flowlab, flowlab.b, 9100, 6.0)
+    res = tcp_connect_from(flowlab, flowlab.a, B_ADDR, 9100, timeout=2.5)
+    assert not res["ok"]                                                       # still waiting when the client gave up
+    out = json.loads(helper.communicate()[0])
+    srv.wait()
+    assert out["errors"] == {}
+
+
+def test_ask_mode_also_asks_about_new_incoming_connections(flowlab):
+    helper = run_flow_helper(flowlab, 6.0, "ask:allow_temp:0.5")
+    srv = tcp_server_in(flowlab, flowlab.a, 9101, 4.5)                          # an app in A listening
+    res = tcp_connect_from(flowlab, flowlab.b, A_ADDR, 9101)
+    out = json.loads(helper.communicate()[0])
+    srv.wait()
+    assert res["ok"], res
+    assert out["asked"] == [{"direction": "in", "ip": B_ADDR, "port": 0}]
+    assert out["rules"] == []                                                  # temporary: nothing stored
+
+
+def test_remote_block_rules_in_the_real_ruleset_drop_only_that_remote_and_only_that_app(lab):
+    scope = lab.make_scope("app-pttest-111.scope")
+    ft = rules.FlowTarget("app-pttest-111.scope", os.path.relpath(scope, lab.root), 20001, 20000,
+                          ({"ip": B_ADDR, "port": 0, "proto": "", "verdict": "block"},))
+    text = rules.build_ruleset([], lab.root, [ft])
+    text = "\n".join(l for l in text.splitlines() if "queue" not in l)          # (queue not loadable here, see above)
+    assert lab.apply_in_a(text) == (True, "")
+    assert server_count(lab, cgroup=scope) == 0                                # the app -> that remote: dropped
+    assert server_count(lab, cgroup=None) == 5                                 # other processes: fine
+    # a different remote of the same app is untouched
+    other = rules.build_ruleset([], lab.root, [rules.FlowTarget(ft.unit, ft.relpath, 20001, 20000,
+                                ({"ip": "10.77.0.99", "port": 0, "proto": "", "verdict": "block"},))])
+    assert lab.apply_in_a("\n".join(l for l in other.splitlines() if "queue" not in l)) == (True, "")
+    assert server_count(lab, cgroup=scope) == 5
+
+
+def test_a_port_rule_blocks_only_that_port(lab):
+    scope = lab.make_scope("app-pttest-111.scope")
+    for port, expected in ((9000, 0), (9005, 5)):
+        ft = rules.FlowTarget("app-pttest-111.scope", os.path.relpath(scope, lab.root), 20001, 20000,
+                              ({"ip": B_ADDR, "port": port, "proto": "udp", "verdict": "block"},))
+        text = "\n".join(l for l in rules.build_ruleset([], lab.root, [ft]).splitlines() if "queue" not in l)
+        assert lab.apply_in_a(text) == (True, "")
+        assert server_count(lab, cgroup=scope) == expected, port
+
+
+def test_incoming_remote_block_stops_that_remote_reaching_the_app(lab):
+    import threading
+    scope = lab.make_scope("app-pttest-111.scope")
+    ft = rules.FlowTarget("app-pttest-111.scope", os.path.relpath(scope, lab.root), 20001, 20000,
+                          ({"ip": B_ADDR, "port": 0, "proto": "", "verdict": "block"},))
+    text = "\n".join(l for l in rules.build_ruleset([], lab.root, [ft]).splitlines() if "queue" not in l)
+    assert lab.apply_in_a(text) == (True, "")
+    result = {}
+    t = threading.Thread(target=lambda: result.update(lab.run_app(cgroup=scope, mode="listen", wait=2.0)))
+    t.start()
+    time.sleep(1.0)
+    lab.b_send(5).wait()
+    t.join()
+    assert result["received"] == 0, result
+
+
+# -- named ports ------------------------------------------------------------------------------------------
+from portcullis.profiles import Profile  # noqa: E402
+
+
+def _port_target(lab, scope, *ports):
+    prof = Profile(name="p", qid=1, enabled=True, ports=list(ports)).sanitize()
+    return rules.Target("app-pttest-111.scope", os.path.relpath(scope, lab.root), prof)
+
+
+def _port(port, **kw):
+    return {"name": f"p{port}", "port": port, "proto": "udp", "direction": "both", "enabled": False, **kw}
+
+
+def test_a_disabled_named_port_blocks_only_that_port_for_that_app(lab):
+    scope = lab.make_scope("app-pttest-111.scope")
+    for port, expected in ((9000, 0), (9005, 5)):
+        assert lab.apply_in_a(rules.build_ruleset([_port_target(lab, scope, _port(port))], lab.root)) == (True, "")
+        assert server_count(lab, cgroup=scope) == expected, port
+        assert server_count(lab, cgroup=None) == 5                           # other apps unaffected
+
+
+def test_an_enabled_named_port_does_nothing(lab):
+    scope = lab.make_scope("app-pttest-111.scope")
+    assert lab.apply_in_a(rules.build_ruleset([_port_target(lab, scope, _port(9000, enabled=True))], lab.root)) == (True, "")
+    assert server_count(lab, cgroup=scope) == 5
+
+
+def test_named_port_protocol_and_direction_are_respected(lab):
+    scope = lab.make_scope("app-pttest-111.scope")
+    # a tcp-only port doesn't touch udp; an incoming-only port doesn't stop outgoing traffic
+    for spec in (_port(9000, proto="tcp"), _port(9000, direction="in")):
+        assert lab.apply_in_a(rules.build_ruleset([_port_target(lab, scope, spec)], lab.root)) == (True, "")
+        assert server_count(lab, cgroup=scope) == 5, spec
+    # 'both' protocols and an outgoing-only port do block it
+    for spec in (_port(9000, proto="both"), _port(9000, direction="out")):
+        assert lab.apply_in_a(rules.build_ruleset([_port_target(lab, scope, spec)], lab.root)) == (True, "")
+        assert server_count(lab, cgroup=scope) == 0, spec
+
+
+def test_a_disabled_incoming_named_port_stops_what_the_app_listens_on(lab):
+    import threading
+    scope = lab.make_scope("app-pttest-111.scope")
+    for spec, expected in ((_port(9001, direction="in"), 0), (_port(9001, direction="out"), 5)):
+        assert lab.apply_in_a(rules.build_ruleset([_port_target(lab, scope, spec)], lab.root)) == (True, "")
+        result = {}
+        t = threading.Thread(target=lambda: result.update(lab.run_app(cgroup=scope, mode="listen", wait=2.0)))
+        t.start()
+        time.sleep(1.0)
+        lab.b_send(5).wait()
+        t.join()
+        assert result["received"] == expected, (spec, result)

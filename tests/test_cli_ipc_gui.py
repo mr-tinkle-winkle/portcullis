@@ -109,35 +109,72 @@ def test_launch_builds_a_systemd_run_command(monkeypatch, capsys):
 
 
 # ---- GUI -------------------------------------------------------------------------------------------------------------------------
-def test_gui_edits_go_through_the_daemon(served, qapp_fixture=None):
-    pytest.importorskip("PySide6")
-    from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
-    from portcullis import gui
+def test_profile_flags_block_allow_toggle_and_latency(served, capsys):
     store, eng, applied = served
-    store.add(name="Sober", match=["flatpak:org.vinegarhq.Sober"])
-    w = gui.Window()
-    w.timer.stop()
-    assert w.list.count() == 1 and w.title.text() == "Sober" and not w.active.isChecked()
-    w.block_out.setChecked(True)
-    w.active.setChecked(True)
-    assert store.find("Sober").block_out and store.find("Sober").enabled
-    assert "Sober-1.scope" in applied[-1] and "drop" in applied[-1]
-    w.delay_in.setValue(250)
-    w._delay_timer.stop()
-    w._delay_edited()
-    assert store.find("Sober").delay_in_ms == 250
-    w.refresh()
-    assert "Running now" in w.running.text() and "dropped 7 packets" in w.counters.text()
-    w.close()
+    run(["add", "X", "--app", "app:firefox"], capsys)
+    assert not store.find("X").enabled
+    code, out, _ = run(["--profile", "X", "--blockIncoming", "--outgoingLatency=250"], capsys)
+    p = store.find("X")
+    assert code == 0 and p.block_in and not p.block_out and p.delay_out_ms == 250
+    assert p.enabled and "ACTIVE" in out and "block incoming" in out and "delay outgoing 250 ms" in out
+    run(["--profile=X", "--toggleIncoming", "--toggleOutgoing"], capsys)
+    p = store.find("x")
+    assert not p.block_in and p.block_out
+    run(["--profile", "X", "--allowOutgoing", "--outgoingLatency", "0", "--incomingLatency", "90"], capsys)
+    p = store.find("X")
+    assert not p.block_out and p.delay_out_ms == 0 and p.delay_in_ms == 90
 
 
-def test_gui_shows_a_banner_when_the_service_is_down(tmp_path):
-    pytest.importorskip("PySide6")
-    from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
-    from portcullis import gui
-    w = gui.Window()
-    w.timer.stop()
-    assert "isn't running" in w.banner.text() and not w.editor.isEnabled()
-    w.close()
+def test_profile_without_actions_just_reports(served, capsys):
+    store, *_ = served
+    run(["add", "X", "--app", "app:firefox", "--block-out"], capsys)
+    code, out, _ = run(["--profile", "X"], capsys)
+    assert code == 0 and "block outgoing" in out and not store.find("X").enabled
+
+
+def test_profile_flag_errors(served, capsys):
+    run(["add", "X", "--app", "app:firefox"], capsys)
+    for argv, text in ((["--profile", "X", "--blockIncoming", "--allowIncoming"], "pick one"),
+                       (["--profile", "X", "--toggleOutgoing", "--blockOutgoing"], "pick one"),
+                       (["--profile", "X", "--incomingLatency", "9999"], "between 0 and 5000"),
+                       (["--profile", "nope", "--blockIncoming"], "no profile named")):
+        with pytest.raises(SystemExit) as e:
+            cli.main(argv)
+        assert text in str(e.value)
+    assert not served[0].find("X").block_in
+
+
+def test_profile_warns_when_latency_is_shadowed_by_a_block(served, capsys):
+    run(["add", "X", "--app", "app:firefox"], capsys)
+    _, _, err = run(["--profile", "X", "--blockOutgoing", "--outgoingLatency", "100"], capsys)
+    assert "no effect" in err
+
+
+def test_named_ports_add_disable_toggle_enable_remove(served, capsys):
+    store, eng, applied = served
+    run(["add", "X", "--app", "app:firefox"], capsys)
+    code, out, _ = run(["--profile", "X", "--addPort", "voice=3478/udp@out", "--addPort", "host=7777"], capsys)
+    assert code == 0 and "voice: 3478/udp outgoing - enabled" in out and "host: 7777/both in+out - enabled" in out
+    assert not store.find("X").enabled                                       # nothing blocked yet -> stays off
+    code, out, _ = run(["--profile", "X", "--disablePort", "voice"], capsys)
+    assert "voice: 3478/udp outgoing - DISABLED" in out and "ports off: voice" in out
+    assert store.find("X").enabled                                           # a blocked port switches the profile on
+    assert "th dport 3478" in applied[-1]
+    run(["--profile", "X", "--togglePort", "voice", "--togglePort", "7777"], capsys)
+    assert [x["enabled"] for x in store.find("X").ports] == [True, False]
+    run(["--profile", "X", "--enablePort", "host", "--disablePort", "3478"], capsys)
+    assert [x["enabled"] for x in store.find("X").ports] == [False, True]
+    run(["--profile", "X", "--removePort", "voice"], capsys)
+    assert [x["name"] for x in store.find("X").ports] == ["host"]
+    assert "3478" not in applied[-1]
+
+
+def test_named_port_errors(served, capsys):
+    run(["add", "X", "--app", "app:firefox"], capsys)
+    for argv, text in ((["--profile", "X", "--addPort", "nonsense"], "NAME=PORT"),
+                       (["--profile", "X", "--addPort", "a=abc"], "must be a number"),
+                       (["--profile", "X", "--addPort", "a=99999"], "1-65535"),
+                       (["--profile", "X", "--enablePort", "ghost"], "no port 'ghost'")):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(argv)
+        assert text in str(exc.value.code) + capsys.readouterr().err

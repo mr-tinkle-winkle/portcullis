@@ -7,6 +7,8 @@ import threading
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
+from . import decisions
+
 MAX_DELAY_MS = 5000
 MAX_NAME = 64
 
@@ -25,6 +27,9 @@ class Profile:
     block_out: bool = False
     delay_in_ms: int = 0
     delay_out_ms: int = 0
+    ask: str = "default"                          # "default" (follow the global setting) | "ask" | "allow"
+    rules: list = field(default_factory=list)     # per-remote rules, see decisions.py
+    ports: list = field(default_factory=list)     # named ports (enable / disable each), see decisions.clean_port
 
     def sanitize(self) -> "Profile":
         self.name = " ".join(str(self.name).split())[:MAX_NAME]
@@ -32,13 +37,42 @@ class Profile:
         self.delay_in_ms = max(0, min(MAX_DELAY_MS, int(self.delay_in_ms)))
         self.delay_out_ms = max(0, min(MAX_DELAY_MS, int(self.delay_out_ms)))
         self.enabled, self.block_in, self.block_out = bool(self.enabled), bool(self.block_in), bool(self.block_out)
+        if self.ask not in ("default", "ask", "allow"):
+            self.ask = "default"
+        clean = []
+        for r in self.rules if isinstance(self.rules, list) else []:
+            try:
+                c = decisions.clean_rule(r)
+            except (KeyError, ValueError, TypeError):
+                continue
+            if c not in clean:
+                clean.append(c)
+        self.rules = clean
+        ports, seen = [], set()
+        for r in self.ports if isinstance(self.ports, list) else []:
+            try:
+                c = decisions.clean_port(r)
+            except (KeyError, ValueError, TypeError):
+                continue
+            if c["name"].lower() not in seen:
+                seen.add(c["name"].lower())
+                ports.append(c)
+        self.ports = ports
         return self
 
     def has_effect(self) -> bool:
         return self.block_in or self.block_out or self.delay_in_ms > 0 or self.delay_out_ms > 0
 
+    def port_blocks(self) -> list:
+        """The named ports that are switched off (their traffic is dropped)."""
+        return [x for x in self.ports if not x["enabled"]]
 
-EDITABLE = {"name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms"}
+    def relevant(self) -> bool:
+        """Does this profile change anything at all (blocking, delay, per-remote rules, ask mode)?"""
+        return self.has_effect() or bool(self.rules) or bool(self.ports) or self.ask != "default"
+
+
+EDITABLE = {"name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask"}
 BOOLS = {"enabled", "block_in", "block_out"}
 
 
@@ -130,6 +164,69 @@ class ProfileStore:
             self._profiles.remove(p)
             self._save()
 
+    def ensure_for(self, identity: str) -> Profile:
+        """The profile for an app identity, created (switched on, empty) when there is none yet --
+        what the map UI does when you first block a connection of an app."""
+        from . import appid
+        with self.lock:
+            for p in self._profiles:
+                if p.enabled and identity in p.match:
+                    return p
+            for p in self._profiles:
+                if identity in p.match:
+                    p.enabled = True
+                    self._save()
+                    return p
+            base = appid.pretty_name(identity)
+            name, n = base, 2
+            while self.find(name):
+                name, n = f"{base} {n}", n + 1
+            return self.add(name=name, match=[identity], enabled=True)
+
+    def set_rule(self, identity: str, rule: dict, clear: bool = False) -> Profile:
+        """Add / replace (or with clear=True remove) the rule for rule's ip[:port/proto]."""
+        with self.lock:
+            p = self.ensure_for(identity)
+            try:
+                new = decisions.clean_rule({"verdict": "allow", **rule})
+            except (KeyError, ValueError, TypeError) as e:
+                raise StoreError(f"bad rule: {e}") from None
+            same = lambda r: (r["ip"], r["port"], r["proto"]) == (new["ip"], new["port"], new["proto"])  # noqa: E731
+            p.rules = [r for r in p.rules if not same(r)]
+            if not clear:
+                p.rules.append(new)
+            self._save()
+            return p
+
+    def port_action(self, p: Profile, action: str, name: str = "", spec: "dict | None" = None) -> Profile:
+        """add / remove / enable / disable / toggle a named port of ``p``.  ``name`` may also be the port number."""
+        with self.lock:
+            def find(key):
+                key = str(key).strip().lower()
+                hit = [x for x in p.ports if x["name"].lower() == key]
+                return hit or [x for x in p.ports if key.isdigit() and x["port"] == int(key)]
+            if action == "add":
+                try:
+                    new = decisions.clean_port(spec or {})
+                except ValueError as e:
+                    raise StoreError(f"bad port: {e}") from None
+                p.ports = [x for x in p.ports if x["name"].lower() != new["name"].lower()] + [new]
+            elif action in ("remove", "enable", "disable", "toggle"):
+                hit = find(name)
+                if not hit:
+                    known = ", ".join(x["name"] for x in p.ports) or "none yet"
+                    raise StoreError(f"{p.name!r} has no port {name!r} (it has: {known})")
+                if action == "remove":
+                    p.ports = [x for x in p.ports if x not in hit]
+                else:
+                    for x in hit:
+                        x["enabled"] = (not x["enabled"]) if action == "toggle" else action == "enable"
+            else:
+                raise StoreError(f"unknown port action {action!r}")
+            p.sanitize()
+            self._save()
+            return p
+
     @staticmethod
     def _apply(p: Profile, changes: dict) -> None:
         for key, val in changes.items():
@@ -144,6 +241,8 @@ class ProfileStore:
                     raise StoreError(f"{key} must be a whole number of milliseconds")
             if key == "match" and not isinstance(val, list):
                 raise StoreError("match must be a list")
+            if key == "ask" and val not in ("default", "ask", "allow"):
+                raise StoreError("ask must be 'default', 'ask' or 'allow'")
             setattr(p, key, val)
         p.sanitize()
         if not p.name:

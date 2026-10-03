@@ -14,6 +14,7 @@ daemon can't cut anyone's network.  Loopback is exempt, so an app's local IPC ke
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -26,6 +27,16 @@ TABLE = "portcullis"
 QUEUE_BASE = 1000
 NFT_CGROUP_ROOT = "/sys/fs/cgroup"                 # nft resolves cgroup paths relative to this
 SAFE_PATH = re.compile(r"^[A-Za-z0-9._@:+\-/\\]+$")
+
+
+@dataclass(frozen=True)
+class FlowTarget:
+    """An app whose new connections are watched (and, in ask mode, held), plus its per-remote block rules."""
+    unit: str
+    relpath: str
+    queue_in: int
+    queue_out: int
+    blocks: tuple = ()          # of decisions-style rule dicts with verdict == "block"
 
 
 def qnum(qid: int, direction: str) -> int:
@@ -59,15 +70,67 @@ def verdict(profile: Profile, direction: str) -> "str | None":
     return "drop" if blocked else "queue" if delay > 0 else None
 
 
-def build_ruleset(targets: "list[Target]", v2root: str, *, exempt_loopback: bool = True) -> str:
+def _remote_match(rule: dict, direction: str) -> str:
+    """The nft match for 'this remote (ip[, port/proto])' as seen in the output or input hook."""
+    ip = ipaddress.ip_address(rule["ip"])
+    fam = "ip6" if ip.version == 6 else "ip"
+    if direction == "out":
+        text = f"{fam} daddr {ip}"
+        side = "dport"
+    else:
+        text = f"{fam} saddr {ip}"
+        side = "sport"
+    if rule.get("port"):
+        text += f" {rule['proto']} {side} {int(rule['port'])}"
+    return text
+
+
+def _port_drops(profile: Profile, direction: str) -> "list[str]":
+    """Match clauses that drop the profile's switched-off named ports (either end of the connection)."""
+    out = []
+    for x in profile.port_blocks():
+        if x["direction"] not in ("both", direction):
+            continue
+        proto = "meta l4proto { tcp, udp }" if x["proto"] == "both" else f"meta l4proto {x['proto']}"
+        for side in ("dport", "sport"):
+            out.append((f"{proto} th {side} {int(x['port'])}", x["port"], side))
+    return out
+
+
+def build_ruleset(targets: "list[Target]", v2root: str, flow_targets: "list[FlowTarget] | tuple" = (),
+                  *, exempt_loopback: bool = True) -> str:
     lines = [f"table inet {TABLE}", f"delete table inet {TABLE}"]
     chains = []
+    # priority -11: before the profile rules below, so an allowed new flow's first packet still meets
+    # any delay / block rule of the app (a queue verdict resumes at the NEXT base chain, not the next rule)
+    for chain, hook, ifkey, direction in (("out_flows", "output", "oifname", "out"), ("in_flows", "input", "iifname", "in")):
+        rules_ = []
+        for ft in flow_targets:
+            path = nft_path(ft.relpath, v2root)
+            if not SAFE_PATH.match(path):
+                continue
+            sel = f'socket cgroupv2 level {level(ft.relpath)} "{path}"'
+            for b in ft.blocks:
+                if b.get("verdict") == "block":
+                    rules_.append(f"    {sel} {_remote_match(b, direction)} counter drop")
+            n = ft.queue_out if direction == "out" else ft.queue_in
+            rules_.append(f'    {sel} ct state new queue flags bypass to {n} comment "pt:flow"')
+        if rules_:
+            head = [f"  chain {chain} {{", f"    type filter hook {hook} priority -11; policy accept;"]
+            if exempt_loopback:
+                head.append(f'    {ifkey} "lo" accept')
+            chains.append("\n".join(head + rules_ + ["  }"]))
     for chain, hook, ifkey, direction in (("out", "output", "oifname", "out"), ("in", "input", "iifname", "in")):
         rules = []
         for t in targets:
             v = verdict(t.profile, direction)
             path = nft_path(t.relpath, v2root)
-            if v is None or not SAFE_PATH.match(path):
+            if not SAFE_PATH.match(path):
+                continue
+            for clause, port, side in _port_drops(t.profile, direction):
+                rules.append(f'    socket cgroupv2 level {level(t.relpath)} "{path}" {clause} counter drop '
+                             f'comment "pt:{t.profile.qid}:{direction}:port{port}{side[0]}"')
+            if v is None:
                 continue
             comment = f"pt:{t.profile.qid}:{direction}:{v}"
             act = "drop" if v == "drop" else f"queue flags bypass to {qnum(t.profile.qid, direction)}"

@@ -7,7 +7,7 @@ The backend is injectable so the logic is testable without a session bus.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Slot
 
 ACTIONS = (("allow_always", "Always allow"), ("allow_temp", "Allow temporarily"),
            ("ignore", "Ignore"), ("block_always", "Always block"))
@@ -35,12 +35,18 @@ class DBusBackend(QObject):
         self._bus = QDBusConnection.sessionBus()
         self.ok = self._bus.isConnected()
         if self.ok:
-            self._bus.connect(SERVICE, PATH, IFACE, "ActionInvoked", self._on_action)
-            self._bus.connect(SERVICE, PATH, IFACE, "NotificationClosed", self._on_closed)
+            # Qt wants the receiver and a SLOT()-style signature ("1name(args)") -- the 5-argument form is a TypeError
+            for name, slot in (("ActionInvoked", "1_on_action(uint,QString)"), ("NotificationClosed", "1_on_closed(uint,uint)")):
+                try:
+                    self._bus.connect(SERVICE, PATH, IFACE, name, self, slot)
+                except Exception:  # noqa: BLE001 -- no notification buttons is better than no window
+                    self.ok = False
 
+    @Slot("uint", str)
     def _on_action(self, nid, key) -> None:
         self.actionInvoked.emit(int(nid), str(key))
 
+    @Slot("uint", "uint")
     def _on_closed(self, nid, _reason=0) -> None:
         self.closed.emit(int(nid))
 

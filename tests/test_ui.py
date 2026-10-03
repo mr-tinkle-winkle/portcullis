@@ -679,3 +679,33 @@ def test_adding_and_switching_a_named_port_in_the_window_reaches_the_daemon_and_
     box.setChecked(True)
     wait(600)
     assert "3478" not in applied[-1]
+
+
+def test_dbus_backend_connects_its_signals_and_receives_them(qapp):
+    """Regression: bus.connect() with 5 arguments raised TypeError and stopped the GUI starting."""
+    import shutil, subprocess, sys, textwrap
+    from portcullis.ui.notifier import DBusBackend
+    DBusBackend()                                                    # must never raise, bus or no bus
+    if not shutil.which("dbus-run-session"):
+        pytest.skip("no dbus-run-session")
+    code = textwrap.dedent("""
+        import subprocess
+        from PySide6.QtCore import QCoreApplication, QTimer
+        from portcullis.ui import notifier
+        notifier.SERVICE = ""                         # no notification daemon here: match any sender
+        app = QCoreApplication([])
+        b = notifier.DBusBackend()
+        got = []
+        b.actionInvoked.connect(lambda n, k: got.append((n, k)))
+        b.closed.connect(lambda n: got.append(("closed", n)))
+        def fire():
+            for member, args in (("ActionInvoked", ["uint32:7", "string:allow_always"]), ("NotificationClosed", ["uint32:8", "uint32:2"])):
+                subprocess.run(["dbus-send", "--session", "--type=signal", "/org/freedesktop/Notifications",
+                                "org.freedesktop.Notifications." + member, *args])
+        QTimer.singleShot(300, fire); QTimer.singleShot(1500, app.quit)
+        app.exec()
+        print(got)
+    """)
+    r = subprocess.run(["dbus-run-session", "--", sys.executable, "-c", code], capture_output=True, text=True,
+                       env={**__import__("os").environ, "QT_QPA_PLATFORM": "offscreen"})
+    assert "[(7, 'allow_always'), ('closed', 8)]" in r.stdout, r.stdout + r.stderr

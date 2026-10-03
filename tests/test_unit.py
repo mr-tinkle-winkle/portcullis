@@ -1,3 +1,4 @@
+import math
 import pytest
 
 from portcullis import appid, delay, rules
@@ -344,3 +345,55 @@ def test_keep_alive_setting_is_validated(tmp_path):
     assert st.update("g", {"block_out_above": 99999}).block_out_above == 1500
     with pytest.raises(StoreError):
         st.update("g", {"block_out_above": "lots"})
+
+
+# -- auto-unblock ------------------------------------------------------------------------------------------------------
+def test_blocks_switch_themselves_off_after_their_time(tmp_path):
+    now = [100.0]
+    st = ProfileStore(tmp_path / "p.json", clock=lambda: now[0])
+    st.add(name="g", match=["app:g"], enabled=True, auto_unblock_out_s=3, auto_unblock_in_s=1.5)
+    assert st.unblock_due() is None                                  # nothing blocked yet
+    st.update("g", {"block_out": True, "block_in": True})
+    assert st.unblock_due() == 1.5
+    now[0] += 1.0
+    assert st.expire_blocks() == []
+    now[0] += 0.6
+    assert st.expire_blocks() == ["g:in"] and not st.find("g").block_in and st.find("g").block_out
+    assert math.isclose(st.unblock_due(), 1.4)
+    now[0] += 0.5
+    st.update("g", {"block_out": True})                              # blocking again restarts the clock
+    now[0] += 2.0
+    assert st.expire_blocks() == []
+    now[0] += 1.0
+    assert st.expire_blocks() == ["g:out"] and not st.find("g").block_out
+    assert ProfileStore(tmp_path / "p.json").find("g").block_out is False      # saved
+
+
+def test_toggle_on_and_a_switched_off_profile_and_never(tmp_path):
+    now = [0.0]
+    st = ProfileStore(tmp_path / "p.json", clock=lambda: now[0])
+    st.add(name="g", match=["app:g"], auto_unblock_out_s=2)
+    st.update("g", {"block_out": "toggle"})                          # profile off: no clock runs
+    now[0] += 5
+    assert st.expire_blocks() == [] and st.find("g").block_out
+    st.update("g", {"enabled": True})                                # switching it on starts the clock
+    now[0] += 1.9
+    assert st.expire_blocks() == []
+    now[0] += 0.2
+    assert st.expire_blocks() == ["g:out"]
+    st.update("g", {"auto_unblock_out_s": 0, "block_out": True})     # 0 = never
+    now[0] += 1000
+    assert st.expire_blocks() == [] and st.find("g").block_out
+    with pytest.raises(StoreError):
+        st.update("g", {"auto_unblock_in_s": "soon"})
+    assert st.update("g", {"auto_unblock_in_s": 1e9}).auto_unblock_in_s == 86400.0
+
+
+def test_a_block_left_on_across_a_restart_counts_from_the_restart(tmp_path):
+    now = [0.0]
+    st = ProfileStore(tmp_path / "p.json", clock=lambda: now[0])
+    st.add(name="g", match=["app:g"], enabled=True, block_in=True, auto_unblock_in_s=4)
+    st2 = ProfileStore(tmp_path / "p.json", clock=lambda: now[0] + 50)     # "the daemon restarted later"
+    assert st2.expire_blocks() == []
+    now[0] += 4.1
+    assert st2.expire_blocks() == ["g:in"]

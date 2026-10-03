@@ -38,6 +38,10 @@ portcullis --profile lag --blockIncoming --outgoingLatency=250   # one-shot form
 portcullis --profile lag --addPort voice=3478/udp@out --addPort host=7777    # name ports for an app
 portcullis --profile lag --disablePort voice --togglePort host --enablePort 7777  # by name or number
 #   (--removePort NAME too; NAME=PORT[/tcp|udp][@in|out], default both protocols and both directions)
+portcullis --app sober --blockOutgoing --autoUnblockOutgoing=3    # an app directly (makes its profile if needed)
+portcullis --override_to_focused --toggleIncoming                  # whatever app owns the focused window
+#   (--override-to-focused / --overrideToFocused also work; it wins over --profile / --app; needs kdotool, KDE)
+portcullis --profile lag --autoUnblockIncoming=1.5                 # blocks switch themselves off after N s (0 = never)
 portcullis apps          # running apps and the profile covering each
 portcullis status        # packet counters
 portcullis doctor        # kernel / tool checks

@@ -38,7 +38,7 @@
         in
         python.pkgs.buildPythonApplication {
           pname = "portcullis";
-          version = "0.3.3";
+          version = "0.4.0";
           format = "pyproject";
           src = ./.;
 
@@ -63,11 +63,12 @@
 
           pythonImportsCheck = [ "portcullis" ];
 
-          # nft: the firewall rules; systemctl/systemd-run: `portcullis launch`.
+          # nft: the firewall rules; systemctl/systemd-run: `portcullis launch`; ss: open connections;
+          # kdotool: which window is focused (--override_to_focused).
           postFixup = ''
             wrapQtApp "$out/bin/portcullis"
             wrapProgram "$out/bin/portcullis" \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nftables pkgs.systemd pkgs.coreutils pkgs.iproute2 ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nftables pkgs.systemd pkgs.coreutils pkgs.iproute2 pkgs.kdotool ]}
 
             mkdir -p "$out/share/applications"
             printf '%s\n' \

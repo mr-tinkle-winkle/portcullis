@@ -11,9 +11,11 @@ portcullis -- per-app network gate.
     portcullis launch NAME -- COMMAND  # start a command in its own app unit (so it can be matched)
     portcullis gui [--hidden] | status | doctor | daemon | geo-update | geo-status
 
-    portcullis --profile NAME [--blockIncoming] [--blockOutgoing] [--allowIncoming] [--allowOutgoing]
-                              [--toggleIncoming] [--toggleOutgoing]
-                              [--incomingLatency MS] [--outgoingLatency MS]
+    portcullis (--profile NAME | --app APP | --override_to_focused)
+               [--blockIncoming] [--blockOutgoing] [--allowIncoming] [--allowOutgoing]
+               [--toggleIncoming] [--toggleOutgoing] [--incomingLatency MS] [--outgoingLatency MS]
+               [--autoUnblockIncoming S] [--autoUnblockOutgoing S] [--keepAlive BYTES]
+               [--addPort NAME=PORT[/tcp|udp][@in|out]] [--enablePort|--disablePort|--togglePort|--removePort NAME]
 """
 from __future__ import annotations
 
@@ -45,7 +47,9 @@ def describe(p: dict) -> str:
     for d, label in (("out", "outgoing"), ("in", "incoming")):
         if p[f"block_{d}"]:
             keep = p.get("block_out_above", 0) if d == "out" else 0
-            bits.append(f"block {label}" + (f" (UDP up to {keep} bytes still goes out)" if keep else ""))
+            auto = p.get(f"auto_unblock_{d}_s", 0)
+            bits.append(f"block {label}" + (f" (UDP up to {keep} bytes still goes out)" if keep else "")
+                        + (f" (unblocks after {auto:g}s)" if auto else ""))
         elif p[f"delay_{d}_ms"]:
             bits.append(f"delay {label} {p[f'delay_{d}_ms']} ms")
     off = [x["name"] for x in p.get("ports", []) if not x["enabled"]]
@@ -105,13 +109,36 @@ def parse_port_spec(text: str) -> dict:
     return {"name": name.strip(), "port": int(num), "proto": proto.strip() or "both", "direction": direction.strip() or "both"}
 
 
+FOCUSED_FLAGS = ("--override_to_focused", "--override-to-focused", "--overrideToFocused")
+TARGET_FLAGS = ("--profile", "--app") + FOCUSED_FLAGS
+
+
+def _is_target_form(argv: "list[str]") -> bool:
+    """``portcullis --profile X ...`` / ``--app Y ...`` / ``--override_to_focused ...`` (no subcommand)."""
+    return bool(argv) and argv[0].startswith("--") and any(
+        a == f or a.startswith(f + "=") for a in argv for f in TARGET_FLAGS)
+
+
+def _resolve_app(pattern: str) -> str:
+    """A full identity (``flatpak:...`` / ``app:...``) as given, otherwise the one running app it matches."""
+    if ":" in pattern:
+        return pattern.strip()
+    return _resolve_running(pattern)
+
+
 def _profile_main(argv: "list[str]") -> int:
-    """``portcullis --profile NAME --blockIncoming --outgoingLatency=250 ...``"""
+    """``portcullis (--profile NAME | --app APP | --override_to_focused) --blockIncoming --outgoingLatency=250 ...``"""
     p = argparse.ArgumentParser(
         prog="portcullis", allow_abbrev=False,
-        description="Change one profile's blocking / latency in a single command.",
-        epilog="Latency 0 removes the delay.  Changing a profile that has an effect also switches it on.")
-    p.add_argument("--profile", required=True, metavar="NAME")
+        description="Change one profile's -- or one app's -- blocking / latency in a single command.",
+        epilog="Latency 0 removes the delay.  Changing a profile that has an effect also switches it on.  "
+               "--app and --override_to_focused create a profile for the app if it has none yet.")
+    tgt = p.add_argument_group("what to change (one of)")
+    tgt.add_argument("--profile", metavar="NAME", help="a profile, by name")
+    tgt.add_argument("--app", metavar="APP", help="an app: a running app's name (e.g. sober) or an identity "
+                                                  "(flatpak:org.vinegarhq.Sober, app:firefox)")
+    tgt.add_argument(*FOCUSED_FLAGS, dest="focused", action="store_true",
+                     help="the app of the focused window (overrides --profile / --app; needs kdotool)")
     for flag, helptext in (("blockIncoming", "block incoming traffic"), ("blockOutgoing", "block outgoing traffic"),
                            ("allowIncoming", "stop blocking incoming traffic"),
                            ("allowOutgoing", "stop blocking outgoing traffic"),
@@ -119,6 +146,10 @@ def _profile_main(argv: "list[str]") -> int:
         p.add_argument(f"--{flag}", dest=flag, action="store_true", help=helptext)
     p.add_argument("--incomingLatency", type=int, metavar="MS", help="fake latency on incoming traffic (0 = none)")
     p.add_argument("--outgoingLatency", type=int, metavar="MS", help="fake latency on outgoing traffic (0 = none)")
+    p.add_argument("--autoUnblockIncoming", type=float, metavar="SECONDS",
+                   help="switch the incoming block off again this long after it goes on (0 = never)")
+    p.add_argument("--autoUnblockOutgoing", type=float, metavar="SECONDS",
+                   help="switch the outgoing block off again this long after it goes on (0 = never)")
     p.add_argument("--keepAlive", type=int, metavar="BYTES",
                    help="while outgoing is blocked, still let UDP packets up to BYTES through (acks / pings keep "
                         "the game connected); 0 = block everything")
@@ -141,35 +172,67 @@ def _profile_main(argv: "list[str]") -> int:
             if not 0 <= ms <= 5000:
                 raise SystemExit(f"portcullis: --{word.lower()}Latency must be between 0 and 5000 ms")
             changes[f"delay_{d}_ms"] = ms
+        secs = getattr(args, f"autoUnblock{word}")
+        if secs is not None:
+            if not 0 <= secs <= 86400:
+                raise SystemExit(f"portcullis: --autoUnblock{word} must be between 0 and 86400 seconds")
+            changes[f"auto_unblock_{d}_s"] = secs
     if args.keepAlive is not None:
         if not 0 <= args.keepAlive <= 1500:
             raise SystemExit("portcullis: --keepAlive must be between 0 and 1500 bytes")
         changes["block_out_above"] = args.keepAlive
+    port_ops = [("add", "", parse_port_spec(t)) for t in args.addPort] + [
+        (action, name, None) for flag, action in (("enablePort", "enable"), ("disablePort", "disable"),
+                                                  ("togglePort", "toggle"), ("removePort", "remove"))
+        for name in getattr(args, flag)]
 
-    def current() -> dict:
-        found = [x for x in _call({"cmd": "list"})["profiles"] if x["name"].lower() == args.profile.lower()]
-        if not found:
-            raise SystemExit(f"portcullis: no profile named {args.profile!r} "
-                             f"(create one: portcullis add {args.profile} --running APP)")
-        return found[0]
+    # -- who
+    identity = None
+    if args.focused:
+        from . import focus
+        try:
+            identity, unit = focus.focused_identity()
+        except focus.FocusError as e:
+            raise SystemExit(f"portcullis: {e}")
+    elif args.app:
+        identity = _resolve_app(args.app)
+    elif not args.profile:
+        raise SystemExit("portcullis: say what to change: --profile NAME, --app APP or --override_to_focused")
 
-    prof = current()
-    for text in args.addPort:
-        _call({"cmd": "port", "name": args.profile, "action": "add", "spec": parse_port_spec(text)})
-    for flag, action in (("enablePort", "enable"), ("disablePort", "disable"), ("togglePort", "toggle"),
-                         ("removePort", "remove")):
-        for pname in getattr(args, flag):
-            _call({"cmd": "port", "name": args.profile, "action": action, "port_name": pname})
-    if args.addPort or any(getattr(args, f) for f in ("enablePort", "disablePort", "togglePort", "removePort")):
-        prof = current()
-    if changes:
-        _call({"cmd": "set", "name": args.profile, "changes": changes})
-        prof = current()
-        if not prof["enabled"] and (any(prof[k] for k in ("block_in", "block_out", "delay_in_ms", "delay_out_ms"))
-                                    or any(not x["enabled"] for x in prof.get("ports", []))):
-            _call({"cmd": "set", "name": args.profile, "changes": {"enabled": True}})
+    profiles = lambda: _call({"cmd": "list"})["profiles"]                         # noqa: E731
+    if identity is None:
+        def current() -> dict:
+            found = [x for x in profiles() if x["name"].lower() == args.profile.lower()]
+            if not found:
+                raise SystemExit(f"portcullis: no profile named {args.profile!r} "
+                                 f"(create one: portcullis add {args.profile} --running APP, or use --app)")
+            return found[0]
+        name = current()["name"]
+        for action, pname, spec in port_ops:
+            _call({"cmd": "port", "name": name, "action": action, "port_name": pname, **({"spec": spec} if spec else {})})
+        if changes:
+            _call({"cmd": "set", "name": name, "changes": changes})
             prof = current()
-    print(f"{prof['name']}: {'ACTIVE' if prof['enabled'] else 'off'} - {describe(prof)}")
+            if not prof["enabled"] and (any(prof[k] for k in ("block_in", "block_out", "delay_in_ms", "delay_out_ms"))
+                                        or any(not x["enabled"] for x in prof.get("ports", []))):
+                _call({"cmd": "set", "name": name, "changes": {"enabled": True}})
+        prof = current()
+    else:
+        name = None
+        if changes or port_ops:
+            name = _call({"cmd": "app", "identity": identity, "changes": changes})["name"]   # creates / switches on
+            for action, pname, spec in port_ops:
+                _call({"cmd": "port", "identity": identity, "action": action, "port_name": pname,
+                       **({"spec": spec} if spec else {})})
+        all_ = profiles()
+        prof = next((x for x in all_ if x["name"] == name), None) if name else \
+            next((x for x in all_ if identity in x["match"] and x["enabled"]), None) or \
+            next((x for x in all_ if identity in x["match"]), None)
+        if prof is None:
+            print(f"{identity}: no profile yet (nothing blocked or delayed)")
+            return 0
+    who = f" ({identity})" if identity else ""
+    print(f"{prof['name']}{who}: {'ACTIVE' if prof['enabled'] else 'off'} - {describe(prof)}")
     for x in prof.get("ports", []):
         where = {"both": "in+out", "in": "incoming", "out": "outgoing"}[x["direction"]]
         print(f"  port {x['name']}: {x['port']}/{x['proto']} {where} - {'enabled' if x['enabled'] else 'DISABLED (blocked)'}")
@@ -203,7 +266,7 @@ def _geo_status() -> int:
 
 def main(argv: "list[str] | None" = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if any(a == "--profile" or a.startswith("--profile=") for a in argv):
+    if _is_target_form(argv):
         return _profile_main(argv)
     p = argparse.ArgumentParser(prog="portcullis", description="Block or delay an app's incoming / outgoing network traffic.")
     p.add_argument("--version", action="version", version=f"portcullis {__version__}")

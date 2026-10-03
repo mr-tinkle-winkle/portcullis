@@ -14,7 +14,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, 
 from PySide6.QtWidgets import (QAbstractButton, QComboBox, QGraphicsOpacityEffect, QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout,
                                QWidget)
 
-from ..ui_kit import (CollapseToggleButton, CustomButton, CustomCheckBox, CustomGroupBox,
+from ..ui_kit import (CollapseToggleButton, CustomButton, CustomCheckBox, CustomDoubleSpinBox, CustomGroupBox,
                       CustomLineEdit, CustomSpinBox, SmoothScrollArea, Theme, combo_box_stylesheet,
                       contrast_text, get_settings, rounded_rect_path)
 from . import model, palette
@@ -637,6 +637,23 @@ class DetailPanel(QWidget):
         keep_spin.editingFinished.connect(lambda sp=keep_spin, i=app.identity: self.changeRequested.emit(i, {"block_out_above": sp.value()}))
         keep.addWidget(keep_spin)
         rl.addLayout(keep)
+        for key, text, colour in (("auto_unblock_out_s", "Auto-unblock outgoing after (s)", sig.output),
+                                  ("auto_unblock_in_s", "Auto-unblock incoming after (s)", sig.input)):
+            row = QHBoxLayout()
+            lab = _label(text, color=colour, wrap=True)
+            lab.setToolTip("Turning the block on starts the clock; when it runs out the block switches itself off.")
+            row.addWidget(lab, stretch=1)
+            spin = CustomDoubleSpinBox()
+            spin.setRange(0, 86400)
+            spin.setDecimals(1)
+            spin.setSingleStep(0.5)
+            spin.setSpecialValueText("never")
+            spin.setValue(float(s.get(key, 0)))
+            spin.setFixedWidth(110)
+            spin.setToolTip(lab.toolTip())
+            spin.editingFinished.connect(lambda sp=spin, k=key, i=app.identity: self.changeRequested.emit(i, {k: sp.value()}))
+            row.addWidget(spin)
+            rl.addLayout(row)
         for key, text, colour in (("delay_out_ms", "Fake latency, outgoing (ms)", sig.output),
                                   ("delay_in_ms", "Fake latency, incoming (ms)", sig.input)):
             row = QHBoxLayout()

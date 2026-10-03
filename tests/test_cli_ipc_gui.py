@@ -189,3 +189,63 @@ def test_keep_alive_flag(served, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["--profile", "X", "--keepAlive=5000"])
     assert "between 0 and 1500" in str(e.value.code)
+
+
+# -- per-app targets and the focused window --------------------------------------------------------------------------
+def test_app_target_blocks_a_running_app_by_name_creating_its_profile(served, capsys):
+    store, eng, applied = served
+    code, out, _ = run(["--app", "sober", "--blockOutgoing", "--autoUnblockOutgoing=2.5"], capsys)
+    p = next(x for x in store.all() if "flatpak:org.vinegarhq.Sober" in x.match)
+    assert code == 0 and p.enabled and p.block_out and p.auto_unblock_out_s == 2.5
+    assert "(flatpak:org.vinegarhq.Sober)" in out and "unblocks after 2.5s" in out
+    assert "Sober-1.scope" in applied[-1]
+    run(["--app", "flatpak:org.vinegarhq.Sober", "--toggleOutgoing", "--addPort", "voice=3478/udp"], capsys)
+    p = next(x for x in store.all() if "flatpak:org.vinegarhq.Sober" in x.match)
+    assert not p.block_out and p.ports[0]["name"] == "voice"
+    code, out, _ = run(["--app", "firefox"], capsys)                   # report only: creates nothing
+    assert "app:firefox: no profile yet" in out and not [x for x in store.all() if "app:firefox" in x.match]
+
+
+def test_override_to_focused_targets_the_focused_windows_app(served, capsys, monkeypatch):
+    from portcullis import focus
+    store, eng, applied = served
+    run(["add", "Lag", "--app", "app:firefox"], capsys)
+    monkeypatch.setattr(focus, "focused_identity", lambda: ("flatpak:org.vinegarhq.Sober", "app-flatpak-org.vinegarhq.Sober-1.scope"))
+    for flag in ("--override_to_focused", "--override-to-focused", "--overrideToFocused"):
+        code, out, _ = run(["--profile", "Lag", flag, "--toggleIncoming"], capsys)    # focused wins over --profile
+        assert code == 0 and "(flatpak:org.vinegarhq.Sober)" in out
+    sober = next(x for x in store.all() if "flatpak:org.vinegarhq.Sober" in x.match)
+    assert sober.block_in is True and not store.find("Lag").block_in   # toggled 3 times; Lag untouched
+
+    def broken():
+        raise focus.FocusError("the focused window isn't running in its own app unit")
+    monkeypatch.setattr(focus, "focused_identity", broken)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--override_to_focused", "--blockOutgoing"])
+    assert "own app unit" in str(e.value.code)
+
+
+def test_target_form_needs_a_target_and_leaves_subcommands_alone(served, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--blockOutgoing"])
+    store, *_ = served
+    assert run(["add", "X", "--app", "app:firefox", "--block-out"], capsys)[0] == 0   # `add --app` still the subcommand
+    assert store.find("X").match == ["app:firefox"]
+
+
+def test_focus_reads_the_window_pid_and_its_app_unit(tmp_path):
+    from portcullis import focus
+    calls = {"getactivewindow": "{abc}", "getwindowpid": "4242", "getwindowclassname": "sober"}
+    run_ = lambda *a: calls.get(a[0])                                    # noqa: E731
+    (tmp_path / "4242").mkdir()
+    (tmp_path / "4242" / "cgroup").write_text(
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.vinegarhq.Sober-77.scope\n")
+    assert focus.focused_identity(run_, str(tmp_path)) == ("flatpak:org.vinegarhq.Sober", "app-flatpak-org.vinegarhq.Sober-77.scope")
+    (tmp_path / "4242" / "cgroup").write_text("0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+                                              "app-org.kde.konsole-12.scope\n")
+    assert focus.focused_identity(run_, str(tmp_path))[0] == "app:org.kde.konsole"
+    (tmp_path / "4242" / "cgroup").write_text("0::/user.slice/user-1000.slice/session-2.scope\n")
+    with pytest.raises(focus.FocusError, match="own app unit"):
+        focus.focused_identity(run_, str(tmp_path))
+    with pytest.raises(focus.FocusError, match="which window"):
+        focus.focused_identity(lambda *a: None, str(tmp_path))

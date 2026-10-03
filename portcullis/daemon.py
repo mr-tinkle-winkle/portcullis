@@ -155,9 +155,13 @@ def run() -> int:
                 if socks is not None:
                     table.observe(flows.socket_flows(socks, engine.current_apps()))
                 table.refresh_open(read_conntrack())
+                for what in store.expire_blocks():
+                    logger.info("auto-unblock: %s", what)
+                    engine.step()
             except Exception:  # noqa: BLE001 -- one bad pass must not kill the service
                 logger.exception("pass failed")
-            wake.wait(1.0)
+            due = store.unblock_due()
+            wake.wait(1.0 if due is None else max(0.02, min(1.0, due)))
             wake.clear()
     finally:
         server.shutdown()

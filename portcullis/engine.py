@@ -175,7 +175,8 @@ class Engine:
             counts = self._counters()
             profiles = []
             for p in self.store.all():
-                d = {k: getattr(p, k) for k in ("name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask", "rules", "ports", "block_out_above")}
+                d = {k: getattr(p, k) for k in ("name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask", "rules", "ports", "block_out_above",
+                                                       "auto_unblock_in_s", "auto_unblock_out_s")}
                 d["running"] = [a.unit for a in self._matches.get(p.name, [])]
                 d["counters"] = {dr: counts.get((p.qid, dr)) for dr in ("in", "out")}
                 profiles.append(d)
@@ -234,7 +235,7 @@ class Engine:
                 if owner:
                     entry["settings"] = {k: getattr(owner, k) for k in
                                          ("enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask",
-                                          "block_out_above")}
+                                          "block_out_above", "auto_unblock_in_s", "auto_unblock_out_s")}
                     entry["rules"] = owner.rules
                     entry["ports"] = owner.ports
                     entry["counters"] = {dr: counts.get((owner.qid, dr)) for dr in ("in", "out")}

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from . import decisions
 
 MAX_DELAY_MS = 5000
 MAX_PACKET = 1500
+MAX_AUTO_S = 86400.0
 MAX_NAME = 64
 
 
@@ -28,6 +30,8 @@ class Profile:
     block_out: bool = False
     delay_in_ms: int = 0
     delay_out_ms: int = 0
+    auto_unblock_in_s: float = 0.0               # switch block_in off again after this long (0 = never)
+    auto_unblock_out_s: float = 0.0              # switch block_out off again after this long (0 = never)
     block_out_above: int = 0                      # with block_out: let outgoing UDP packets up to this size through
                                                   # (0 = block everything).  Keeps the game's acks/keep-alives flowing.
     ask: str = "default"                          # "default" (follow the global setting) | "ask" | "allow"
@@ -40,6 +44,8 @@ class Profile:
         self.delay_in_ms = max(0, min(MAX_DELAY_MS, int(self.delay_in_ms)))
         self.delay_out_ms = max(0, min(MAX_DELAY_MS, int(self.delay_out_ms)))
         self.block_out_above = max(0, min(MAX_PACKET, int(self.block_out_above)))
+        for k in ("auto_unblock_in_s", "auto_unblock_out_s"):
+            setattr(self, k, round(max(0.0, min(MAX_AUTO_S, float(getattr(self, k)))), 2))
         self.enabled, self.block_in, self.block_out = bool(self.enabled), bool(self.block_in), bool(self.block_out)
         if self.ask not in ("default", "ask", "allow"):
             self.ask = "default"
@@ -76,7 +82,8 @@ class Profile:
         return self.has_effect() or bool(self.rules) or bool(self.ports) or self.ask != "default"
 
 
-EDITABLE = {"name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask", "block_out_above"}
+EDITABLE = {"name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask", "block_out_above",
+            "auto_unblock_in_s", "auto_unblock_out_s"}
 BOOLS = {"enabled", "block_in", "block_out"}
 
 
@@ -85,8 +92,10 @@ class StoreError(ValueError):
 
 
 class ProfileStore:
-    def __init__(self, path: "Path | None" = None):
+    def __init__(self, path: "Path | None" = None, clock=time.monotonic):
         self.path = Path(path) if path else state_dir() / "profiles.json"
+        self._clock = clock
+        self._since: dict = {}                     # (qid, "in"|"out") -> when that block (last) went on
         self.lock = threading.RLock()
         self._profiles: "list[Profile]" = []
         self._next_qid = 0
@@ -141,6 +150,7 @@ class ProfileStore:
                 raise StoreError(f"a profile named {name!r} already exists")
             p = Profile(name=name, qid=self._next_qid)
             self._apply(p, {k: v for k, v in fields_.items() if k != "name"})
+            self._track(p, fields_)
             self._next_qid += 1
             self._profiles.append(p)
             self._save()
@@ -157,8 +167,52 @@ class ProfileStore:
                 if other is not None and other.qid != p.qid:
                     raise StoreError(f"a profile named {new_name!r} already exists")
             self._apply(p, changes)
+            self._track(p, changes)
             self._save()
             return p
+
+    # -- auto-unblock ---------------------------------------------------------------------------
+    def _track(self, p: Profile, changes: dict) -> None:
+        """Remember when a block went on: (re)setting it, or switching the profile on, starts its clock again."""
+        now = self._clock()
+        for d in ("in", "out"):
+            key = (p.qid, d)
+            if p.enabled and getattr(p, f"block_{d}"):
+                if f"block_{d}" in changes or "enabled" in changes or key not in self._since:
+                    self._since[key] = now
+            else:
+                self._since.pop(key, None)
+
+    def expire_blocks(self) -> "list[str]":
+        """Switch off blocks whose auto-unblock time is up; returns 'profile:direction' for each."""
+        done = []
+        with self.lock:
+            now = self._clock()
+            for p in self._profiles:
+                for d in ("in", "out"):
+                    after = getattr(p, f"auto_unblock_{d}_s")
+                    if not (after > 0 and p.enabled and getattr(p, f"block_{d}")):
+                        continue
+                    since = self._since.setdefault((p.qid, d), now)      # (blocked before a restart: count from now)
+                    if now - since >= after:
+                        setattr(p, f"block_{d}", False)
+                        self._since.pop((p.qid, d), None)
+                        done.append(f"{p.name}:{d}")
+            if done:
+                self._save()
+        return done
+
+    def unblock_due(self) -> "float | None":
+        """Seconds until the next auto-unblock, or None when none is pending."""
+        with self.lock:
+            now, best = self._clock(), None
+            for p in self._profiles:
+                for d in ("in", "out"):
+                    after = getattr(p, f"auto_unblock_{d}_s")
+                    if after > 0 and p.enabled and getattr(p, f"block_{d}"):
+                        left = after - (now - self._since.get((p.qid, d), now))
+                        best = left if best is None else min(best, left)
+            return None if best is None else max(0.0, best)
 
     def remove(self, name: str) -> None:
         with self.lock:
@@ -179,6 +233,7 @@ class ProfileStore:
             for p in self._profiles:
                 if identity in p.match:
                     p.enabled = True
+                    self._track(p, {"enabled": True})
                     self._save()
                     return p
             base = appid.pretty_name(identity)
@@ -240,6 +295,9 @@ class ProfileStore:
                 val = not getattr(p, key)
             if key in BOOLS and not isinstance(val, bool):
                 raise StoreError(f"{key} must be true, false or 'toggle'")
+            if key in ("auto_unblock_in_s", "auto_unblock_out_s"):
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    raise StoreError(f"{key} must be a number of seconds")
             if key in ("delay_in_ms", "delay_out_ms", "block_out_above"):
                 if isinstance(val, bool) or not isinstance(val, int):
                     raise StoreError(f"{key} must be a whole number of milliseconds")

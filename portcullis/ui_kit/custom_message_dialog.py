@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QRectF
 from PySide6.QtGui import QPainter
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLayout, QSizePolicy
 
 from .theme_config import get_settings
 from .theme import Theme
@@ -37,6 +37,10 @@ class CustomMessageDialog(QDialog):
         text_label = QLabel(text)
         text_label.setWordWrap(True)
         text_label.setStyleSheet(f"color: {appearance.color_text};")
+        # A word-wrapped label only reports its wrapped height for a known width, so give the dialog one and let
+        # the layout size the window to fit (without this long messages are cut off after two lines).
+        text_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.MinimumExpanding)
+        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(text_label)
 
         button_row = QHBoxLayout()
@@ -46,7 +50,10 @@ class CustomMessageDialog(QDialog):
         button_row.addWidget(ok_btn)
         layout.addLayout(button_row)
 
-        self.setMinimumWidth(320)
+        self.setFixedWidth(480)
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
+        text_label.setMinimumHeight(text_label.heightForWidth(480 - 48))
+        self.adjustSize()
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)

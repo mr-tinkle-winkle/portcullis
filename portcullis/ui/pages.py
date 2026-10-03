@@ -64,6 +64,7 @@ class SettingsPage(Page):
     guiSettingChanged = Signal()              # the window re-reads self.cfg
     locationApplied = Signal(float, float)
     updateGeoClicked = Signal()
+    importGeoClicked = Signal()
     themeSaved = Signal()
 
     def __init__(self, cfg: "guicfg.GuiConfig"):
@@ -131,7 +132,14 @@ class SettingsPage(Page):
         d.addWidget(self.geo_status)
         self.geo_button = CustomButton("Download / update location data")
         self.geo_button.clicked.connect(self.updateGeoClicked)
-        d.addWidget(self.geo_button, alignment=Qt.AlignRight)
+        self.geo_file_button = CustomButton("Use a file I downloaded...")
+        self.geo_file_button.setToolTip("Pick dbip-city-lite-YYYY-MM.mmdb.gz (or .mmdb) from db-ip.com/db/download/ip-to-city-lite")
+        self.geo_file_button.clicked.connect(self.importGeoClicked)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self.geo_file_button)
+        row.addWidget(self.geo_button)
+        d.addLayout(row)
         credit = QLabel(geo.ATTRIBUTION + ". Looked up offline: no address ever leaves your machine.")
         credit.setWordWrap(True)
         d.addWidget(credit)
@@ -222,6 +230,7 @@ class SettingsPage(Page):
         else:
             self.geo_status.setText("No location data yet: the map can't place any connection. Download it once.")
         self.geo_button.setEnabled(not busy)
+        self.geo_file_button.setEnabled(not busy)
 
     def _pick(self, edit) -> None:
         c = QColorDialog.getColor(QColor(edit.text()) if palette.valid(edit.text()) else QColor("#808080"), self)

@@ -98,7 +98,36 @@ class Geo:
         return place
 
 
-def update(dest: "Path | None" = None, *, opener=urllib.request.urlopen, today: "date | None" = None,
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) portcullis/0.1 (+https://github.com/mr-tinkle-winkle/portcullis)"
+
+
+def _open(url: str, timeout: float = 60):
+    """urlopen with a real User-Agent: db-ip.com answers 403 to Python's default one."""
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"}),
+                                  timeout=timeout)
+
+
+def install_file(src: "str | Path", dest: "Path | None" = None) -> Path:
+    """Use a database you downloaded yourself (.mmdb or .mmdb.gz), after checking that it opens."""
+    import maxminddb
+    src, dest = Path(src), Path(dest) if dest else db_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".mmdb.new")
+    try:
+        if src.suffix == ".gz":
+            with gzip.open(src, "rb") as gz, open(tmp, "wb") as out:
+                shutil.copyfileobj(gz, out)
+        else:
+            shutil.copyfile(src, tmp)
+        maxminddb.open_database(str(tmp)).close()
+    except Exception as e:  # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"{src.name} isn't a usable location database: {e}") from None
+    os.replace(tmp, dest)
+    return dest
+
+
+def update(dest: "Path | None" = None, *, opener=_open, today: "date | None" = None,
            progress=lambda msg: None) -> Path:
     """Download the newest available monthly database (this month, else the last two).  Atomic."""
     dest = Path(dest) if dest else db_path()
@@ -128,7 +157,9 @@ def update(dest: "Path | None" = None, *, opener=urllib.request.urlopen, today: 
             p.unlink()
         except OSError:
             pass
-    raise RuntimeError("couldn't download the location database (" + "; ".join(errors) + ")")
+    raise RuntimeError("couldn't download the location database (" + "; ".join(errors) + "). "
+                       "You can download dbip-city-lite-YYYY-MM.mmdb.gz yourself from db-ip.com/db/download/ip-to-city-lite "
+                       "and choose it with 'Use a file I downloaded' (or: portcullis geo-update --file FILE).")
 
 
 def age_days(path: "Path | None" = None) -> "int | None":

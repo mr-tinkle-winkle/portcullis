@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout,
+import math
+
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtWidgets import (QAbstractButton, QComboBox, QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout,
                                QWidget)
 
 from ..ui_kit import (CollapseToggleButton, CustomButton, CustomCheckBox, CustomGroupBox,
@@ -193,11 +195,41 @@ class Surface(QWidget):
 
 
 # ============================================================================== app list (left)
+class StarButton(QAbstractButton):
+    """A pin toggle drawn as a star (no icon font needed): solid when pinned, an outline otherwise."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(24, 24)
+        self._theme = Theme()
+
+    def paintEvent(self, e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        c = QColor(self._theme.text())
+        c.setAlphaF(1.0 if self.isChecked() else (0.75 if self.underMouse() else 0.4))
+        cx, cy, ro, ri = self.width() / 2, self.height() / 2 + 0.5, 9.0, 3.8
+        pts = [QPointF(cx + (ro if i % 2 == 0 else ri) * math.sin(i * math.pi / 5),
+                       cy - (ro if i % 2 == 0 else ri) * math.cos(i * math.pi / 5)) for i in range(10)]
+        p.setPen(QPen(c, 1.4))
+        p.setBrush(c if self.isChecked() else Qt.NoBrush)
+        p.drawPolygon(QPolygonF(pts))
+
+    def enterEvent(self, e) -> None:
+        self.update()
+
+    def leaveEvent(self, e) -> None:
+        self.update()
+
+
 class AppRow(Surface):
     clicked = Signal(str)
     allowToggled = Signal(str, bool)
+    pinToggled = Signal(str, bool)
 
-    def __init__(self, app: "model.AppView", selected: bool):
+    def __init__(self, app: "model.AppView", selected: bool, pinned: bool = False):
         super().__init__(radius=16)
         self.identity = app.identity
         lay = QHBoxLayout(self)
@@ -220,6 +252,11 @@ class AppRow(Surface):
         col.addWidget(self.name)
         col.addWidget(self.sub)
         lay.addLayout(col, stretch=1)
+        self.star = StarButton()
+        self.star.setChecked(pinned)
+        self.star.setToolTip("Unpin from the top of the list" if pinned else "Pin to the top of the list")
+        self.star.toggled.connect(lambda on: self.pinToggled.emit(self.identity, on))
+        lay.addWidget(self.star)
         self.allow = StateCheckBox("")
         self.allow.setChecked(app.allowed)
         self.allow.setToolTip("Allow this app's network traffic (off blocks both directions)")
@@ -262,10 +299,12 @@ class AppRow(Surface):
 class AppListPanel(QWidget):
     selected = Signal(str)
     allowToggled = Signal(str, bool)
+    pinToggled = Signal(str, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._theme = Theme()
+        self._pinned: list = []
         self._apps: list = []
         self._selected: "str | None" = None
         self._rows: "dict[str, AppRow]" = {}
@@ -291,10 +330,13 @@ class AppListPanel(QWidget):
         self.scroll.viewport().setAutoFillBackground(False)
         outer.addWidget(self.scroll, stretch=1)
 
+    def set_pinned(self, pinned: list) -> None:
+        self._pinned = list(pinned)
+
     def set_apps(self, apps: list, selected: "str | None") -> None:
         self._apps, self._selected = apps, selected
         sig = (tuple((a.identity, a.running, a.allowed, a.ask, a.active_count, a.blocked_count) for a in apps),
-               self.search.text())
+               self.search.text(), tuple(self._pinned))
         if sig == self._sig:                                 # nothing visible changed: don't rebuild (kit pitfall 14)
             self.set_selected(selected)
             return
@@ -315,16 +357,17 @@ class AppListPanel(QWidget):
         self._rows = {}
         shown = [a for a in self._apps if not q or q in a.name.lower() or q in a.identity.lower()]
         for a in shown:
-            row = AppRow(a, a.identity == self._selected)
+            row = AppRow(a, a.identity == self._selected, a.identity in self._pinned)
             row.clicked.connect(self.selected)
             row.allowToggled.connect(self.allowToggled)
+            row.pinToggled.connect(self.pinToggled)
             self._rows[a.identity] = row
             self.body_lay.addWidget(row)
         if not shown:
             msg = "No apps match." if q else "No apps yet. Start an app and it will appear here."
             self.body_lay.addWidget(_label(msg, muted_=True, wrap=True))
         self.body_lay.addStretch(1)
-        self._sig = (self._sig[0], self.search.text()) if self._sig else None
+        self._sig = (self._sig[0], self.search.text(), tuple(self._pinned)) if self._sig else None
 
 
 # ============================================================================== connection rows (right)

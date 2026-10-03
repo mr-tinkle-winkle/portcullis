@@ -78,3 +78,40 @@ def test_world_map_data_is_packaged_and_sane():
     assert len(data["rings"]) > 200
     for ring in data["rings"][:50]:
         assert all(-180 <= x <= 180 and -90 <= y <= 90 for x, y in ring)
+
+
+def test_the_default_opener_sends_a_real_user_agent(monkeypatch):
+    """db-ip.com answers 403 to Python's default User-Agent (the failure seen on a real machine)."""
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["ua"], seen["url"] = req.get_header("User-agent"), req.full_url
+        return io.BytesIO(b"")
+    monkeypatch.setattr(geo.urllib.request, "urlopen", fake_urlopen)
+    geo._open("https://download.db-ip.com/free/x.mmdb.gz")
+    assert seen["ua"].startswith("Mozilla/5.0") and "portcullis" in seen["ua"] and "urllib" not in seen["ua"].lower()
+
+
+def test_failure_message_points_to_the_manual_route(tmp_path):
+    def refuse(url, timeout=None):
+        raise OSError("HTTP Error 403: Forbidden")
+    with pytest.raises(RuntimeError) as e:
+        geo.update(tmp_path / "x.mmdb", opener=refuse, today=date(2026, 10, 3))
+    assert "403" in str(e.value) and "Use a file I downloaded" in str(e.value) and "--file" in str(e.value)
+
+
+def test_install_file_accepts_mmdb_and_gz_and_rejects_junk(tmp_path, mmdb):
+    dest = tmp_path / "dest" / "db.mmdb"
+    geo.install_file(mmdb, dest)
+    assert geo.Geo(dest).lookup("8.8.8.8").city == "Mountain View"
+    gz = tmp_path / "db.mmdb.gz"
+    gz.write_bytes(gzip.compress(mmdb.read_bytes()))
+    dest2 = tmp_path / "dest2.mmdb"
+    geo.install_file(gz, dest2)
+    assert geo.Geo(dest2).available
+    junk = tmp_path / "junk.mmdb"
+    junk.write_bytes(b"not a database")
+    with pytest.raises(RuntimeError, match="isn't a usable"):
+        geo.install_file(junk, dest)
+    assert geo.Geo(dest).lookup("8.8.8.8").city == "Mountain View"          # the old one survived
+    assert not list(dest.parent.glob("*.new"))

@@ -709,3 +709,58 @@ def test_dbus_backend_connects_its_signals_and_receives_them(qapp):
     r = subprocess.run(["dbus-run-session", "--", sys.executable, "-c", code], capture_output=True, text=True,
                        env={**__import__("os").environ, "QT_QPA_PLATFORM": "offscreen"})
     assert "[(7, 'allow_always'), ('closed', 8)]" in r.stdout, r.stdout + r.stderr
+
+
+# -- pinning, dialog sizing, importing a location file --------------------------------------------------------
+def test_pinning_an_app_moves_it_to_the_top_keeps_it_and_persists(win):
+    w, rec = win
+    assert [a.name for a in w.apps] == ["firefox", "Sober", "steam", "discord"]
+    w.applist._rows["app:steam"].star.setChecked(True)
+    assert [a.name for a in w.apps][0] == "steam" and w.cfg.pinned == ["app:steam"]
+    w.applist._rows["app:discord"].star.setChecked(True)
+    assert [a.name for a in w.apps][:2] == ["steam", "discord"]               # in the order pinned
+    assert guicfg.load().pinned == ["app:steam", "app:discord"]               # saved
+    assert [i for i, r in w.applist._rows.items()][:2] == ["app:steam", "app:discord"]
+    assert w.applist._rows["app:steam"].star.isChecked() and not w.applist._rows["app:firefox"].star.isChecked()
+    w.applist._rows["app:steam"].star.setChecked(False)
+    assert w.cfg.pinned == ["app:discord"] and [a.name for a in w.apps][0] == "discord"
+
+
+def test_a_pinned_app_the_daemon_has_not_seen_still_appears():
+    apps = model.build_apps(overview(), FakeGeo().lookup, None, ["flatpak:com.example.Game", "app:steam"])
+    assert [a.identity for a in apps][:2] == ["flatpak:com.example.Game", "app:steam"]
+    ghost = apps[0]
+    assert ghost.name == "Game" and not ghost.running and ghost.remotes == []
+
+
+def test_config_cleans_the_pinned_list(tmp_path):
+    cfg = guicfg.GuiConfig(pinned=["a", "a", "", 5, "b"]).sanitize()
+    assert cfg.pinned == ["a", "b"]
+
+
+def test_long_messages_are_not_cut_off(qapp):
+    from portcullis.ui_kit.custom_message_dialog import CustomMessageDialog
+    text = ("couldn't download the location database (2026-10: HTTP Error 403: Forbidden; 2026-09: HTTP Error 403: "
+            "Forbidden; 2026-08: HTTP Error 403: Forbidden). You can download dbip-city-lite-YYYY-MM.mmdb.gz yourself.")
+    d = CustomMessageDialog("Location data", text)
+    d.show()
+    label = [l for l in d.findChildren(__import__("PySide6.QtWidgets", fromlist=["QLabel"]).QLabel) if l.text() == text][0]
+    need = label.heightForWidth(label.width())
+    assert label.height() >= need > 40, (label.height(), need)
+    assert d.height() >= need + 60
+    d.close()
+
+
+def test_importing_a_location_file_from_the_settings_page(win, tmp_path):
+    w, rec = win
+    calls = []
+    import portcullis.ui.window as winmod
+    orig = winmod.geomod.install_file
+    winmod.geomod.install_file = lambda p: calls.append(p) or tmp_path
+    try:
+        w.settings_page.importGeoClicked.connect(lambda: None)
+        w.import_geo("/some/db.mmdb.gz")
+        wait(900)
+    finally:
+        winmod.geomod.install_file = orig
+    assert calls == ["/some/db.mmdb.gz"]

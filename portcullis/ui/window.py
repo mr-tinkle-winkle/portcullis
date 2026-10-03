@@ -116,6 +116,7 @@ class MainWindow(QMainWindow):
         # ---- wiring
         self.applist.selected.connect(self.select_app)
         self.applist.allowToggled.connect(self.on_app_allow)
+        self.applist.pinToggled.connect(self.on_pin_toggled)
         self.map.appSelected.connect(self.on_pin_selected)
         self.map.locationChanged.connect(self.on_location)
         self.detail.changeRequested.connect(self.on_change)
@@ -128,6 +129,7 @@ class MainWindow(QMainWindow):
         s.guiSettingChanged.connect(self.on_gui_setting)
         s.locationApplied.connect(self.on_location)
         s.updateGeoClicked.connect(self.update_geo)
+        s.importGeoClicked.connect(self.choose_geo_file)
         s.themeSaved.connect(lambda: guicfg.save(self.cfg))
         self.bridge.overview.connect(self.on_overview)
         self.bridge.down.connect(self.on_down)
@@ -174,12 +176,13 @@ class MainWindow(QMainWindow):
 
     def on_overview(self, ov: dict) -> None:
         self._down_reason = ""
+        self._last_ov = ov
         self.pending = ov.get("pending", [])
         if self.cfg.resolve_hostnames:
             ips = [r["ip"] for a in ov.get("apps", []) for r in a.get("remotes", []) if not model.is_local_ip(r["ip"])]
             self.resolver.want(ips)
         names = self.resolver.names if self.cfg.resolve_hostnames else {}
-        self.apps = model.build_apps(ov, self.geo.lookup, names)
+        self.apps = model.build_apps(ov, self.geo.lookup, names, self.cfg.pinned)
         self.settings_page.load_daemon_settings(ov.get("settings", {}))
         if self.notifier is not None:
             self.notifier.sync(self.pending, self.cfg.notifications)
@@ -190,6 +193,7 @@ class MainWindow(QMainWindow):
         if sig == self._sig:
             return
         self._sig = sig
+        self.applist.set_pinned(self.cfg.pinned)
         self.applist.set_apps(self.apps, self.selected)
         self.map.set_data(model.build_pins(self.apps), model.local_items(self.apps), self.selected)
         self.detail.show_app(self.app(self.selected), self.cfg.advanced_ports, self.focus_ip)
@@ -282,18 +286,39 @@ class MainWindow(QMainWindow):
         self.settings_page.set_location(self.cfg.my_lat, self.cfg.my_lon)
         self._update_hint()
 
+    def on_pin_toggled(self, identity: str, pinned: bool) -> None:
+        if pinned and identity not in self.cfg.pinned:
+            self.cfg.pinned.append(identity)
+        elif not pinned and identity in self.cfg.pinned:
+            self.cfg.pinned.remove(identity)
+        guicfg.save(self.cfg)
+        self._sig = None
+        if getattr(self, "_last_ov", None) is not None:
+            self.on_overview(self._last_ov)          # re-sorts: pinned apps first
+        else:
+            self.on_overview_refresh()
+
     def on_gui_setting(self) -> None:
         guicfg.save(self.cfg)
         self._sig = None
         self.on_overview_refresh()
 
     # ---- location database ----------------------------------------------------------------------------------------
-    def update_geo(self) -> None:
+    def choose_geo_file(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(self, "Location database", "", "DB-IP City Lite (*.mmdb *.mmdb.gz);;All files (*)")
+        if path:
+            self.import_geo(path)
+
+    def import_geo(self, path: str) -> None:
+        self.update_geo(lambda: geomod.install_file(path), busy="Installing…")
+
+    def update_geo(self, job=None, busy: str = "Downloading…") -> None:
         from concurrent.futures import ThreadPoolExecutor
-        self.settings_page.set_geo_status(self.geo.available, None, busy="Downloading…")
+        self.settings_page.set_geo_status(self.geo.available, None, busy=busy)
         if not hasattr(self, "_geo_pool"):
             self._geo_pool = ThreadPoolExecutor(max_workers=1)
-        fut = self._geo_pool.submit(self._download)
+        fut = self._geo_pool.submit(job or self._download)
 
         def poll():
             if not fut.done():

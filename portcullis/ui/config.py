@@ -32,6 +32,7 @@ class GuiConfig:
     advanced_ports: bool = False         # per-port rows and toggles in the connection list
     resolve_hostnames: bool = False      # reverse-DNS the remote addresses (asks your DNS resolver about each one)
     notifications: bool = True           # desktop notification for every question in ask mode
+    pinned: list = field(default_factory=list)   # app identities pinned to the top of the list
     signal_input: str = "#f2994a"        # orange: input / incoming
     signal_output: str = "#4da3ff"       # blue: output / outgoing
     signal_special: str = "#b07cff"      # purple: both directions / special
@@ -43,6 +44,7 @@ class GuiConfig:
     def sanitize(self) -> "GuiConfig":
         self.my_lat = max(-85.0, min(85.0, float(self.my_lat)))
         self.my_lon = max(-180.0, min(180.0, float(self.my_lon)))
+        self.pinned = list(dict.fromkeys(str(x) for x in self.pinned if isinstance(x, str) and x))
         import re
         for name in ("signal_input", "signal_output", "signal_special", "signal_on", "signal_off"):
             if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(getattr(self, name))):

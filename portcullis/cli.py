@@ -171,11 +171,11 @@ def _profile_main(argv: "list[str]") -> int:
     return 0
 
 
-def _geo_update() -> int:
+def _geo_update(file: "str | None" = None) -> int:
     from . import geo
     dest = geo.db_path()
     try:
-        used = geo.update(dest, progress=lambda m: print(m, flush=True))
+        used = geo.install_file(file, dest) if file else geo.update(dest, progress=lambda m: print(m, flush=True))
     except Exception as e:  # noqa: BLE001
         print(f"geo-update failed: {e}", file=sys.stderr)
         return 1
@@ -206,7 +206,8 @@ def main(argv: "list[str] | None" = None) -> int:
     sub.add_parser("doctor", help="check what this system supports")
     g = sub.add_parser("gui", help="open the window")
     g.add_argument("--hidden", action="store_true", help="start in the tray only (for autostart)")
-    sub.add_parser("geo-update", help="download the offline DB-IP City Lite location database")
+    gu = sub.add_parser("geo-update", help="download the offline DB-IP City Lite location database")
+    gu.add_argument("--file", metavar="PATH", help="install a database you downloaded yourself (.mmdb or .mmdb.gz)")
     sub.add_parser("geo-status", help="show whether the location database is installed")
     sub.add_parser("daemon", help="the system service")
 
@@ -244,7 +245,7 @@ def main(argv: "list[str] | None" = None) -> int:
         from . import gui
         return gui.run(hidden=args.hidden)
     if cmd == "geo-update":
-        return _geo_update()
+        return _geo_update(args.file)
     if cmd == "geo-status":
         return _geo_status()
     if cmd in ("list", "status"):

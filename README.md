@@ -43,6 +43,7 @@ portcullis status        # packet counters
 portcullis doctor        # kernel / tool checks
 portcullis gui [--hidden]   # the map window (--hidden = tray only; the NixOS module autostarts it)
 portcullis geo-update    # download the offline DB-IP City Lite database (needed for the map pins)
+portcullis geo-update --file ~/Downloads/dbip-city-lite-2026-10.mmdb.gz   # or install one you downloaded yourself
 portcullis geo-status
 portcullis launch NAME -- some-command   # for apps with no unit of their own
 ```
@@ -54,7 +55,7 @@ same direction. Max delay 5000 ms. Loopback is never touched.
 
 World map with a pin per remote location, each joined to **You** by an arc. Drag your own pin (or set
 lat/lon in Settings) to show any place on stream; private/LAN addresses collect in a "Local Network" pill.
-Left: every app with connections. Select one (list or its pin) and the right panel lists its
+Left: every app with connections; the star pins an app to the top (kept even when it isn't running). Select one (list or its pin) and the right panel lists its
 incoming/outgoing remotes, each with an allow toggle (all on by default) plus a master **Allow**.
 Rules are per remote IP, any port; **Advanced** in Settings adds per-port rows and a per-port ask toggle.
 

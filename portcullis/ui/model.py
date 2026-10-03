@@ -74,9 +74,11 @@ def is_local_ip(ip: str) -> bool:
     return a.is_private or a.is_loopback or a.is_link_local or a.is_multicast
 
 
-def build_apps(overview: dict, locate, hostnames: "dict | None" = None) -> "list[AppView]":
-    """``locate(ip) -> Place | None``; ``hostnames`` maps ip -> name (already resolved)."""
+def build_apps(overview: dict, locate, hostnames: "dict | None" = None, pinned: "list | None" = None) -> "list[AppView]":
+    """``locate(ip) -> Place | None``; ``hostnames`` maps ip -> name (already resolved).  Pinned apps come first (in
+    the order they were pinned) and stay listed even when the daemon has not seen them lately."""
     hostnames = hostnames or {}
+    pinned = list(pinned or [])
     out = []
     for a in overview.get("apps", []):
         remotes = []
@@ -89,7 +91,11 @@ def build_apps(overview: dict, locate, hostnames: "dict | None" = None) -> "list
                 ports=list(r.get("ports", [])), hostname=hostnames.get(r["ip"], "")))
         out.append(AppView(a["identity"], appid.pretty_name(a["identity"]), bool(a.get("running")), a.get("profile"),
                            bool(a.get("ask")), a.get("settings"), remotes, a.get("counters"), list(a.get("ports", []))))
-    out.sort(key=lambda x: (not x.running, -x.active_count, x.name.lower()))
+    for ident in pinned:
+        if not any(a.identity == ident for a in out):
+            out.append(AppView(ident, appid.pretty_name(ident), False, None, False, None, []))
+    out.sort(key=lambda x: (x.identity not in pinned, pinned.index(x.identity) if x.identity in pinned else 0,
+                            not x.running, -x.active_count, x.name.lower()))
     return out
 
 

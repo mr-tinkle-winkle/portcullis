@@ -20,7 +20,12 @@
           inherit version;
           hash = "sha256-4w7/mZMlYX9UvZWz2NM1MhTMd7XjGI+Q7DpvYoiIjXI=";
         };
-        nativeBuildInputs = [ pkgs.python3.pkgs.setuptools ];
+        # The sdist ships a pre-generated _impl.c that doesn't compile on Python 3.14;
+        # delete it so Cython regenerates it from _impl.pyx.
+        prePatch = ''
+          rm -f netfilterqueue/_impl.c
+        '';
+        nativeBuildInputs = [ pkgs.python3.pkgs.setuptools pkgs.python3.pkgs.cython ];
         buildInputs = [ pkgs.libnetfilter_queue pkgs.libnfnetlink ];
         doCheck = false;
         pythonImportsCheck = [ "netfilterqueue" ];

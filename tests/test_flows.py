@@ -148,13 +148,13 @@ def test_flow_chains_come_before_profile_chains_and_carry_blocks():
         {"ip": "9.9.9.9", "port": 0, "proto": "", "verdict": "allow"}))
     text = rules.build_ruleset([], "/sys/fs/cgroup", [ft])
     assert "chain out_flows" in text and "chain in_flows" in text and "priority -11" in text
-    assert "ip daddr 1.2.3.4 counter drop" in text and "ip saddr 1.2.3.4 counter drop" in text
-    assert "ip6 daddr 2001:db8::1 tcp dport 443 counter drop" in text and "ip6 saddr 2001:db8::1 tcp sport 443 counter drop" in text
+    assert "ip daddr 1.2.3.4 counter queue to 65000" in text and "ip saddr 1.2.3.4 counter drop" in text
+    assert "ip6 daddr 2001:db8::1 tcp dport 443 counter queue to 65000" in text and "ip6 saddr 2001:db8::1 tcp sport 443 counter drop" in text
     assert "9.9.9.9" not in text                                   # allow rules never become nft rules
     assert "ct state new queue flags bypass to 20000" in text and "ct state new queue flags bypass to 20001" in text
     # block rules sit before the queue rule of the same app
     out = text.split("chain in_flows")[0]
-    assert out.index("drop") < out.index("queue")
+    assert out.index("queue to 65000") < out.index("queue flags bypass")
 
 
 def test_no_flow_targets_means_the_old_ruleset_unchanged():

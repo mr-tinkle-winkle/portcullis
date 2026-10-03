@@ -673,7 +673,7 @@ def test_adding_and_switching_a_named_port_in_the_window_reaches_the_daemon_and_
     box.setChecked(False)
     wait(600)
     assert store.find("firefox").ports[0]["enabled"] is False
-    assert "th dport 3478 counter drop" in applied[-1]
+    assert "th dport 3478 counter queue to 65000" in applied[-1]
     box = next(b for b in w.detail.findChildren(StateCheckBox) if b.toolTip().startswith("Enabled:"))
     assert not box.isChecked()                                         # the window re-read the daemon
     box.setChecked(True)

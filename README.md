@@ -116,6 +116,14 @@ Not verified:
 - the systemd service hardening, the tray, and D-Bus notification action buttons on a real Plasma session
 - the real DB-IP download (only a synthetic .mmdb was tested), and the Nix build with the new deps
 
+## Why outgoing blocks are "queued"
+
+A plain nftables `drop` in the output hook makes the app's own send call fail with EPERM ("Operation not
+permitted"). Games treat that as a dead socket and stop receiving too, so "block outgoing" used to cut both
+directions in Roblox. portcullis now discards outgoing packets by queueing them to queue 65000, which nobody reads,
+without `bypass`: the kernel drops them silently and the app believes it sent them, like a Windows firewall.
+(Incoming drops were always silent.) Don't run another program that listens on NFQUEUE 65000.
+
 ## Caveats
 
 - Apps started from a terminal share the terminal's unit and cannot be told apart; use `portcullis launch`.

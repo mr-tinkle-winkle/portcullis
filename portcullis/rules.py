@@ -24,6 +24,18 @@ from dataclasses import dataclass
 from .profiles import Profile
 
 TABLE = "portcullis"
+
+# Outgoing packets are dropped by queueing them to a queue nobody listens on (and without ``bypass``): the kernel
+# then discards them *silently*.  A plain ``drop`` in the output hook makes the sending call fail with EPERM
+# ("Operation not permitted") inside the app -- and games (Roblox among them) treat that as a broken socket and
+# stop receiving too, so "block outgoing" would cut both directions.  Windows firewalls drop silently, like this.
+SILENT_DROP_QUEUE = 65000
+SILENT_OUT = True          # tests on kernels without nft's queue statement switch this off
+
+
+def drop_stmt(direction: str) -> str:
+    """How to discard a packet in this direction (see SILENT_DROP_QUEUE)."""
+    return f"queue to {SILENT_DROP_QUEUE}" if direction == "out" and SILENT_OUT else "drop"
 QUEUE_BASE = 1000
 NFT_CGROUP_ROOT = "/sys/fs/cgroup"                 # nft resolves cgroup paths relative to this
 SAFE_PATH = re.compile(r"^[A-Za-z0-9._@:+\-/\\]+$")
@@ -112,7 +124,7 @@ def build_ruleset(targets: "list[Target]", v2root: str, flow_targets: "list[Flow
             sel = f'socket cgroupv2 level {level(ft.relpath)} "{path}"'
             for b in ft.blocks:
                 if b.get("verdict") == "block":
-                    rules_.append(f"    {sel} {_remote_match(b, direction)} counter drop")
+                    rules_.append(f"    {sel} {_remote_match(b, direction)} counter {drop_stmt(direction)}")
             n = ft.queue_out if direction == "out" else ft.queue_in
             rules_.append(f'    {sel} ct state new queue flags bypass to {n} comment "pt:flow"')
         if rules_:
@@ -128,12 +140,12 @@ def build_ruleset(targets: "list[Target]", v2root: str, flow_targets: "list[Flow
             if not SAFE_PATH.match(path):
                 continue
             for clause, port, side in _port_drops(t.profile, direction):
-                rules.append(f'    socket cgroupv2 level {level(t.relpath)} "{path}" {clause} counter drop '
+                rules.append(f'    socket cgroupv2 level {level(t.relpath)} "{path}" {clause} counter {drop_stmt(direction)} '
                              f'comment "pt:{t.profile.qid}:{direction}:port{port}{side[0]}"')
             if v is None:
                 continue
             comment = f"pt:{t.profile.qid}:{direction}:{v}"
-            act = "drop" if v == "drop" else f"queue flags bypass to {qnum(t.profile.qid, direction)}"
+            act = drop_stmt(direction) if v == "drop" else f"queue flags bypass to {qnum(t.profile.qid, direction)}"
             rules.append(f'    socket cgroupv2 level {level(t.relpath)} "{path}" counter {act} comment "{comment}"')
         if rules:
             head = [f"  chain {chain} {{", f"    type filter hook {hook} priority -10; policy accept;"]

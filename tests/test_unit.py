@@ -85,7 +85,7 @@ def test_ruleset_blocks_and_delays_per_direction():
     text = rules.build_ruleset([tgt(block_out=True, delay_in_ms=120)], "/sys/fs/cgroup")
     assert 'socket cgroupv2 level 5 "user.slice/user-1000.slice/user@1000.service/app.slice/app-x-1.scope"' in text
     out_part, in_part = text.split("chain in")
-    assert "drop" in out_part and "queue" not in out_part
+    assert "counter queue to 65000" in out_part and "bypass" not in out_part and "drop" not in out_part.replace(":drop", "")
     assert f"queue flags bypass to {rules.qnum(3, 'in')}" in in_part and "drop" not in in_part
     assert text.startswith("table inet portcullis\ndelete table inet portcullis\n")
     assert 'oifname "lo" accept' in text and 'iifname "lo" accept' in text
@@ -310,7 +310,16 @@ def test_disabled_ports_become_drop_rules_in_the_right_chains(tmp_path):
         {"name": "c", "port": 1111, "proto": "tcp", "direction": "both", "enabled": True}]).sanitize()
     text = rules.build_ruleset([rules.Target("app-x.scope", "a/b/app-x.scope", prof)], "/sys/fs/cgroup")
     out_chain, in_chain = text.split("chain in ")[0], text.split("chain in ")[1]
-    assert "meta l4proto udp th dport 3478 counter drop" in out_chain and "th sport 3478" in out_chain
+    assert "meta l4proto udp th dport 3478 counter queue to 65000" in out_chain and "th sport 3478" in out_chain
     assert "7777" not in out_chain and "3478" not in in_chain
     assert "meta l4proto { tcp, udp } th dport 7777 counter drop" in in_chain
     assert "1111" not in text                                    # enabled ports emit nothing
+
+
+def test_outgoing_blocks_are_silent_and_incoming_ones_plain_drops(monkeypatch):
+    """A plain drop in the output hook surfaces as EPERM in the app (games then stop receiving as well)."""
+    assert rules.drop_stmt("out") == "queue to 65000" and rules.drop_stmt("in") == "drop"
+    assert "bypass" not in rules.drop_stmt("out")                 # bypass would let the packets through
+    monkeypatch.setattr(rules, "SILENT_OUT", False)
+    assert rules.drop_stmt("out") == "drop"
+    assert rules.SILENT_DROP_QUEUE not in {rules.qnum(q, d) for q in range(5000) for d in ("in", "out")}

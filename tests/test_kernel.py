@@ -39,6 +39,21 @@ pytestmark = pytest.mark.skipif(not _can_run(), reason="needs root, ip, nft, cgr
 A_ADDR, B_ADDR = "10.77.0.1", "10.77.0.2"
 
 
+def _nft_has_queue() -> bool:
+    probe = ("table inet ptqprobe { chain o { type filter hook output priority 0; "
+             "meta mark 0x7fffffff queue to 65000; }; }")
+    r = subprocess.run(["nft", "-c", "-f", "-"], input=probe, capture_output=True, text=True)
+    return r.returncode == 0
+
+
+@pytest.fixture(autouse=True)
+def _silent_out_where_supported(monkeypatch):
+    """This test kernel may lack nft's queue statement; then outgoing blocks are loaded as plain drops (the silent
+    variant's kernel behaviour is checked separately with iptables' NFQUEUE, which uses the same queue core)."""
+    if not _nft_has_queue():
+        monkeypatch.setattr(rules, "SILENT_OUT", False)
+
+
 def ns(name):
     """Run a command inside a network namespace *without* `ip netns exec` (which remounts /sys and
     would hide the cgroup tree from nft)."""
@@ -566,3 +581,38 @@ def test_existing_tcp_connections_are_found_with_their_app_and_direction(lab):
     t.refresh_open(None)
     rem = {(r["ip"], r["direction"]): r for r in t.remotes("app:pttest")}
     assert rem[(B_ADDR, "out")]["active"] and rem[(B_ADDR, "in")]["active"]
+
+
+
+# -- why outgoing blocks are queued, not dropped ----------------------------------------------------------------------
+SEND = """
+import json, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+res = []
+for i in range(3):
+    try:
+        s.sendto(b"x" * 100, ("%s", 9000)); res.append("ok")
+    except OSError as e:
+        res.append(e.errno)
+print(json.dumps(res))
+"""
+
+
+def test_a_plain_output_drop_fails_the_apps_send_call_but_an_unheard_queue_drops_silently(lab):
+    import errno
+    send = SEND % B_ADDR
+    srv = lab.b_listen(2.0)
+    time.sleep(0.2)
+    # plain drop: the app sees EPERM on every send
+    assert lab.apply_in_a(f"table inet {rules.TABLE} {{\n chain out {{\n  type filter hook output priority -10;\n"
+                          f"  udp dport 9000 drop\n }}\n}}\n") == (True, "")
+    r = json.loads(sh(*ns(lab.a), sys.executable, "-c", send).stdout)
+    assert r == [errno.EPERM] * 3, r
+    sh(*ns(lab.a), "nft", "delete", "table", "inet", rules.TABLE)
+    # queue to a queue nobody reads, without bypass (iptables NFQUEUE = the same kernel path as nft's queue)
+    assert sh(*ns(lab.a), "iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "9000", "-j", "NFQUEUE",
+              "--queue-num", str(rules.SILENT_DROP_QUEUE)).returncode == 0
+    r = json.loads(sh(*ns(lab.a), sys.executable, "-c", send).stdout)
+    sh(*ns(lab.a), "iptables", "-F", "OUTPUT")
+    assert r == ["ok"] * 3, r                                     # the app thinks it sent
+    assert json.loads(srv.communicate()[0])["received"] == 0      # ...but nothing left the machine

@@ -178,3 +178,14 @@ def test_named_port_errors(served, capsys):
         with pytest.raises(SystemExit) as exc:
             cli.main(argv)
         assert text in str(exc.value.code) + capsys.readouterr().err
+
+
+def test_keep_alive_flag(served, capsys):
+    store, eng, applied = served
+    run(["add", "X", "--app", "app:firefox"], capsys)
+    code, out, _ = run(["--profile", "X", "--blockOutgoing", "--keepAlive=120"], capsys)
+    assert code == 0 and store.find("X").block_out_above == 120 and "UDP up to 120 bytes still goes out" in out
+    assert "udp length > 128" in applied[-1]
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--profile", "X", "--keepAlive=5000"])
+    assert "between 0 and 1500" in str(e.value.code)

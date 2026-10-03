@@ -146,7 +146,14 @@ def build_ruleset(targets: "list[Target]", v2root: str, flow_targets: "list[Flow
                 continue
             comment = f"pt:{t.profile.qid}:{direction}:{v}"
             act = drop_stmt(direction) if v == "drop" else f"queue flags bypass to {qnum(t.profile.qid, direction)}"
-            rules.append(f'    socket cgroupv2 level {level(t.relpath)} "{path}" counter {act} comment "{comment}"')
+            sel = f'socket cgroupv2 level {level(t.relpath)} "{path}"'
+            above = t.profile.block_out_above if (direction == "out" and v == "drop") else 0
+            if above:
+                # "keep alive" block: small UDP packets (acks, pings) still go out, everything bigger does not
+                rules.append(f'    {sel} udp length > {int(above) + 8} counter {act} comment "{comment}"')
+                rules.append(f'    {sel} meta l4proto != udp counter {act} comment "{comment}"')
+            else:
+                rules.append(f'    {sel} counter {act} comment "{comment}"')
         if rules:
             head = [f"  chain {chain} {{", f"    type filter hook {hook} priority -10; policy accept;"]
             if exempt_loopback:

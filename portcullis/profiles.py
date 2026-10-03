@@ -10,6 +10,7 @@ from pathlib import Path
 from . import decisions
 
 MAX_DELAY_MS = 5000
+MAX_PACKET = 1500
 MAX_NAME = 64
 
 
@@ -27,6 +28,8 @@ class Profile:
     block_out: bool = False
     delay_in_ms: int = 0
     delay_out_ms: int = 0
+    block_out_above: int = 0                      # with block_out: let outgoing UDP packets up to this size through
+                                                  # (0 = block everything).  Keeps the game's acks/keep-alives flowing.
     ask: str = "default"                          # "default" (follow the global setting) | "ask" | "allow"
     rules: list = field(default_factory=list)     # per-remote rules, see decisions.py
     ports: list = field(default_factory=list)     # named ports (enable / disable each), see decisions.clean_port
@@ -36,6 +39,7 @@ class Profile:
         self.match = [str(m).strip() for m in self.match if str(m).strip()]
         self.delay_in_ms = max(0, min(MAX_DELAY_MS, int(self.delay_in_ms)))
         self.delay_out_ms = max(0, min(MAX_DELAY_MS, int(self.delay_out_ms)))
+        self.block_out_above = max(0, min(MAX_PACKET, int(self.block_out_above)))
         self.enabled, self.block_in, self.block_out = bool(self.enabled), bool(self.block_in), bool(self.block_out)
         if self.ask not in ("default", "ask", "allow"):
             self.ask = "default"
@@ -72,7 +76,7 @@ class Profile:
         return self.has_effect() or bool(self.rules) or bool(self.ports) or self.ask != "default"
 
 
-EDITABLE = {"name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask"}
+EDITABLE = {"name", "match", "enabled", "block_in", "block_out", "delay_in_ms", "delay_out_ms", "ask", "block_out_above"}
 BOOLS = {"enabled", "block_in", "block_out"}
 
 
@@ -236,7 +240,7 @@ class ProfileStore:
                 val = not getattr(p, key)
             if key in BOOLS and not isinstance(val, bool):
                 raise StoreError(f"{key} must be true, false or 'toggle'")
-            if key in ("delay_in_ms", "delay_out_ms"):
+            if key in ("delay_in_ms", "delay_out_ms", "block_out_above"):
                 if isinstance(val, bool) or not isinstance(val, int):
                     raise StoreError(f"{key} must be a whole number of milliseconds")
             if key == "match" and not isinstance(val, list):

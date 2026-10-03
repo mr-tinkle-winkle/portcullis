@@ -616,3 +616,24 @@ def test_a_plain_output_drop_fails_the_apps_send_call_but_an_unheard_queue_drops
     sh(*ns(lab.a), "iptables", "-F", "OUTPUT")
     assert r == ["ok"] * 3, r                                     # the app thinks it sent
     assert json.loads(srv.communicate()[0])["received"] == 0      # ...but nothing left the machine
+
+
+def test_keep_alive_block_drops_big_outgoing_udp_but_lets_small_packets_out(lab):
+    scope = lab.make_scope("app-pttest-111.scope")
+    prof = Profile(name="p", qid=1, enabled=True, block_out=True, block_out_above=100).sanitize()
+    t = rules.Target("app-pttest-111.scope", os.path.relpath(scope, lab.root), prof)
+    assert lab.apply_in_a(rules.build_ruleset([t], lab.root)) == (True, "")
+    for size, expected in ((20, 5), (100, 5), (101, 0), (600, 0)):
+        srv = lab.b_listen(1.5)
+        time.sleep(0.2)
+        code = textwrap.dedent(f"""
+            import os, socket, time
+            open(os.path.join({scope!r}, "cgroup.procs"), "w").write(str(os.getpid()))
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            for i in range(5):
+                try: s.sendto(b"x" * {size}, ({B_ADDR!r}, 9000))
+                except OSError: pass
+                time.sleep(0.02)
+        """)
+        sh(*ns(lab.a), sys.executable, "-c", code)
+        assert json.loads(srv.communicate()[0])["received"] == expected, size

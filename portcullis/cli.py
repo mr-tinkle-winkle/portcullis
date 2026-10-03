@@ -44,7 +44,8 @@ def describe(p: dict) -> str:
     bits = []
     for d, label in (("out", "outgoing"), ("in", "incoming")):
         if p[f"block_{d}"]:
-            bits.append(f"block {label}")
+            keep = p.get("block_out_above", 0) if d == "out" else 0
+            bits.append(f"block {label}" + (f" (UDP up to {keep} bytes still goes out)" if keep else ""))
         elif p[f"delay_{d}_ms"]:
             bits.append(f"delay {label} {p[f'delay_{d}_ms']} ms")
     off = [x["name"] for x in p.get("ports", []) if not x["enabled"]]
@@ -118,6 +119,9 @@ def _profile_main(argv: "list[str]") -> int:
         p.add_argument(f"--{flag}", dest=flag, action="store_true", help=helptext)
     p.add_argument("--incomingLatency", type=int, metavar="MS", help="fake latency on incoming traffic (0 = none)")
     p.add_argument("--outgoingLatency", type=int, metavar="MS", help="fake latency on outgoing traffic (0 = none)")
+    p.add_argument("--keepAlive", type=int, metavar="BYTES",
+                   help="while outgoing is blocked, still let UDP packets up to BYTES through (acks / pings keep "
+                        "the game connected); 0 = block everything")
     p.add_argument("--addPort", action="append", default=[], metavar="NAME=PORT[/tcp|udp][@in|out]",
                    help="name a port for this app, e.g. voice=3478/udp  or  host=7777/udp@in (repeatable)")
     for flag, helptext in (("enablePort", "allow that port's traffic again"), ("disablePort", "block that port's traffic"),
@@ -137,6 +141,10 @@ def _profile_main(argv: "list[str]") -> int:
             if not 0 <= ms <= 5000:
                 raise SystemExit(f"portcullis: --{word.lower()}Latency must be between 0 and 5000 ms")
             changes[f"delay_{d}_ms"] = ms
+    if args.keepAlive is not None:
+        if not 0 <= args.keepAlive <= 1500:
+            raise SystemExit("portcullis: --keepAlive must be between 0 and 1500 bytes")
+        changes["block_out_above"] = args.keepAlive
 
     def current() -> dict:
         found = [x for x in _call({"cmd": "list"})["profiles"] if x["name"].lower() == args.profile.lower()]

@@ -323,3 +323,24 @@ def test_outgoing_blocks_are_silent_and_incoming_ones_plain_drops(monkeypatch):
     monkeypatch.setattr(rules, "SILENT_OUT", False)
     assert rules.drop_stmt("out") == "drop"
     assert rules.SILENT_DROP_QUEUE not in {rules.qnum(q, d) for q in range(5000) for d in ("in", "out")}
+
+
+def test_keep_alive_block_lets_small_udp_out_and_nothing_else():
+    text = rules.build_ruleset([tgt(block_out=True, block_out_above=100)], "/sys/fs/cgroup")
+    out_part = text.split("chain in")[0]
+    assert "udp length > 108 counter" in out_part                  # payload > 100 bytes (+8 for the UDP header)
+    assert "meta l4proto != udp counter" in out_part               # TCP etc.: still all blocked
+    plain = rules.build_ruleset([tgt(block_out=True)], "/sys/fs/cgroup")
+    assert "udp length" not in plain
+    # the setting only shapes an outgoing *block*; it never applies to incoming or to a delay
+    assert "udp length" not in rules.build_ruleset([tgt(block_in=True, block_out_above=100)], "/sys/fs/cgroup")
+    assert "udp length" not in rules.build_ruleset([tgt(delay_out_ms=50, block_out_above=100)], "/sys/fs/cgroup")
+
+
+def test_keep_alive_setting_is_validated(tmp_path):
+    st = ProfileStore(tmp_path / "p.json")
+    st.add(name="g", match=["app:g"])
+    assert st.update("g", {"block_out_above": 120}).block_out_above == 120
+    assert st.update("g", {"block_out_above": 99999}).block_out_above == 1500
+    with pytest.raises(StoreError):
+        st.update("g", {"block_out_above": "lots"})

@@ -621,6 +621,22 @@ class DetailPanel(QWidget):
             cb.setChecked(bool(s.get(key)))
             cb.toggled.connect(lambda on, k=key, i=app.identity: self.changeRequested.emit(i, {k: on}))
             rl.addLayout(row)
+        keep = QHBoxLayout()
+        keep_lab = _label("Keep-alive while blocked (bytes)", color=sig.output, wrap=True)
+        keep_lab.setToolTip("Games stop sending you updates when they hear nothing back. With this set, tiny packets "
+                            "(acks, pings) still go out while bigger ones (your movement) are blocked, so you keep "
+                            "seeing others while they stop seeing you. 0 = block everything. Try 100 and adjust.")
+        keep.addWidget(keep_lab, stretch=1)
+        keep_spin = CustomSpinBox()
+        keep_spin.setRange(0, 1500)
+        keep_spin.setSingleStep(10)
+        keep_spin.setSpecialValueText("off")
+        keep_spin.setValue(int(s.get("block_out_above", 0)))
+        keep_spin.setFixedWidth(110)
+        keep_spin.setToolTip(keep_lab.toolTip())
+        keep_spin.editingFinished.connect(lambda sp=keep_spin, i=app.identity: self.changeRequested.emit(i, {"block_out_above": sp.value()}))
+        keep.addWidget(keep_spin)
+        rl.addLayout(keep)
         for key, text, colour in (("delay_out_ms", "Fake latency, outgoing (ms)", sig.output),
                                   ("delay_in_ms", "Fake latency, incoming (ms)", sig.input)):
             row = QHBoxLayout()

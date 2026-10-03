@@ -1,6 +1,6 @@
 [project]
 name = "portcullis"
-version = "0.3.2"
+version = "0.3.3"
 description = "Per-app network gate: block or add latency to incoming / outgoing traffic, with auto-detected apps"
 requires-python = ">=3.11"
 dependencies = [

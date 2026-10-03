@@ -124,6 +124,14 @@ directions in Roblox. portcullis now discards outgoing packets by queueing them 
 without `bypass`: the kernel drops them silently and the app believes it sent them, like a Windows firewall.
 (Incoming drops were always silent.) Don't run another program that listens on NFQUEUE 65000.
 
+## Block outgoing, but keep the connection alive
+
+Even a silent outgoing block freezes *both* directions in games like Roblox: the server stops sending you updates
+once it hears nothing back (no acks, no pings). "Keep-alive while blocked (bytes)" (CLI: `--keepAlive=BYTES`) lets
+outgoing UDP packets up to that size through while the block is on; the small housekeeping packets keep the
+server talking to you, the bigger ones (your movement) don't arrive. Start around 100 and adjust: too low freezes
+everything again, too high lets your movement through. TCP stays fully blocked.
+
 ## Caveats
 
 - Apps started from a terminal share the terminal's unit and cannot be told apart; use `portcullis launch`.

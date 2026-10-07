@@ -1,9 +1,9 @@
 """Page chrome (kit rules: every page scrolls, paints its own background and outline) and the Settings page."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter
-from PySide6.QtWidgets import QColorDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QColorDialog, QComboBox, QFormLayout, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from .. import geo
 from ..ui_kit import (CustomButton, CustomCheckBox, CustomDoubleSpinBox, CustomGroupBox, CustomSpinBox,
@@ -57,6 +57,43 @@ def _row(text: str, widget) -> QWidget:
     h.addWidget(lab, stretch=1)
     h.addWidget(widget)
     return w
+
+
+class OverlayPreview(QWidget):
+    """A small picture of the screen with the overlay panel in the chosen corner (sample content)."""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setMinimumHeight(170)
+        self._theme = Theme()
+
+    @staticmethod
+    def sample_lines():
+        from ..overlay import model
+        return [model.Line("Sober", [model.Chip("OUT", "out", 3.4), model.Chip("keep-alive 100 B", "note")]),
+                model.Line("firefox", [model.Chip("IN", "in"), model.Chip("port voice", "special")])]
+
+    def paintEvent(self, e) -> None:
+        from ..overlay.paint import PanelPainter
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        t = self._theme
+        screen = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        p.fillRect(screen, t.page_background().darker(140))
+        p.setPen(t.accent())
+        p.drawRect(screen)
+        k = 0.45                                                   # the preview is a scaled-down screen
+        painter = PanelPainter(self.cfg.overlay_scale * k, self.font())
+        lines = self.sample_lines()
+        if not self.cfg.overlay_enabled:
+            p.setPen(t.text())
+            p.drawText(screen, Qt.AlignCenter, "Overlay off")
+            return
+        m = self.cfg.overlay_margin * k
+        rect = PanelPainter.placed(self.cfg.overlay_corner, painter.size(lines, 0.0), screen.adjusted(m, m, -m, -m))
+        painter.paint(p, rect, lines, 0.0, palette.signals(), t.surface(), t.text())
+        p.end()
 
 
 class SettingsPage(Page):
@@ -116,6 +153,42 @@ class SettingsPage(Page):
                             "Drag the gaps between the list, the map and the connection panel to resize them."))
         vw.itemAt(vw.count() - 1).widget().setWordWrap(True)
         b.addWidget(view)
+
+        ov = CustomGroupBox("Overlay")
+        o = ov.make_layout(QVBoxLayout)
+        hint = QLabel("A small panel in a corner of the screen that lists what is blocked right now; it disappears "
+                      "when nothing is. It runs as its own process (portcullis overlay, started with your session).")
+        hint.setWordWrap(True)
+        o.addWidget(hint)
+        self.ov_enabled = StateCheckBox("Show the overlay while something is blocked")
+        self.ov_ports = StateCheckBox("Include switched-off named ports")
+        self.ov_addresses = StateCheckBox("Include single blocked addresses")
+        self.ov_running = StateCheckBox("Only apps that are running")
+        for w in (self.ov_enabled, self.ov_ports, self.ov_addresses, self.ov_running):
+            o.addWidget(w)
+        self.ov_corner = QComboBox()
+        from ..ui_kit import combo_box_stylesheet, get_settings
+        self.ov_corner.setStyleSheet(combo_box_stylesheet(get_settings()))
+        for value, text in (("top-left", "Top left"), ("top-right", "Top right"), ("bottom-left", "Bottom left"),
+                            ("bottom-right", "Bottom right")):
+            self.ov_corner.addItem(text, value)
+        self.ov_corner.setCurrentIndex(max(0, self.ov_corner.findData(cfg.overlay_corner)))
+        o.addWidget(_row("Corner", self.ov_corner))
+        self.ov_margin = CustomSpinBox()
+        self.ov_margin.setRange(0, 400)
+        self.ov_margin.setFixedWidth(110)
+        self.ov_margin.setValue(cfg.overlay_margin)
+        o.addWidget(_row("Distance from the screen edges (px)", self.ov_margin))
+        self.ov_scale = CustomDoubleSpinBox()
+        self.ov_scale.setRange(0.5, 3.0)
+        self.ov_scale.setSingleStep(0.1)
+        self.ov_scale.setDecimals(1)
+        self.ov_scale.setFixedWidth(110)
+        self.ov_scale.setValue(cfg.overlay_scale)
+        o.addWidget(_row("Size", self.ov_scale))
+        self.ov_preview = OverlayPreview(cfg)
+        o.addWidget(self.ov_preview)
+        b.addWidget(ov)
 
         loc = CustomGroupBox("My location on the map")
         l = loc.make_layout(QVBoxLayout)
@@ -198,6 +271,13 @@ class SettingsPage(Page):
         self.advanced.toggled.connect(lambda on: self._gui("advanced_ports", on))
         self.resolve.toggled.connect(lambda on: self._gui("resolve_hostnames", on))
         self.globe.toggled.connect(lambda on: self._gui("map_mode", "globe" if on else "flat"))
+        for box, key in ((self.ov_enabled, "overlay_enabled"), (self.ov_ports, "overlay_ports"),
+                         (self.ov_addresses, "overlay_addresses"), (self.ov_running, "overlay_only_running")):
+            box.setChecked(getattr(cfg, key))
+            box.toggled.connect(lambda on, k=key: self._overlay(k, on))
+        self.ov_corner.activated.connect(lambda i: self._overlay("overlay_corner", self.ov_corner.itemData(i)))
+        self.ov_margin.valueChanged.connect(lambda v: self._overlay("overlay_margin", int(v)))
+        self.ov_scale.valueChanged.connect(lambda v: self._overlay("overlay_scale", round(float(v), 2)))
         self.show_hidden.toggled.connect(lambda on: self._gui("show_hidden", on))
         self.globe.setChecked(cfg.map_mode == "globe")
         self.show_hidden.setChecked(cfg.show_hidden)
@@ -216,6 +296,10 @@ class SettingsPage(Page):
         if not self._loading:
             setattr(self.cfg, key, value)
             self.guiSettingChanged.emit()
+
+    def _overlay(self, key: str, value) -> None:
+        self._gui(key, value)
+        self.ov_preview.update()
 
     def sync_gui(self, cfg) -> None:
         """Reflect changes made elsewhere (the map's corner button, the list's 'show hidden') without echoing them."""

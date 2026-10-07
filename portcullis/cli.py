@@ -9,7 +9,7 @@ portcullis -- per-app network gate.
     portcullis on|off|toggle NAME      # the master switch -- bind these to keys / a Stream Deck
     portcullis remove NAME
     portcullis launch NAME -- COMMAND  # start a command in its own app unit (so it can be matched)
-    portcullis gui [--hidden] | status | doctor | daemon | geo-update | geo-status
+    portcullis gui [--hidden] | overlay | status | doctor | daemon | geo-update | geo-status
 
     portcullis (--profile NAME | --app APP | --override_to_focused)
                [--blockIncoming] [--blockOutgoing] [--allowIncoming] [--allowOutgoing]
@@ -280,6 +280,7 @@ def main(argv: "list[str] | None" = None) -> int:
     gu = sub.add_parser("geo-update", help="download the offline DB-IP City Lite location database")
     gu.add_argument("--file", metavar="PATH", help="install a database you downloaded yourself (.mmdb or .mmdb.gz)")
     sub.add_parser("geo-status", help="show whether the location database is installed")
+    sub.add_parser("overlay", help="the on-screen 'what's blocked' panel (started with your session)")
     sub.add_parser("daemon", help="the system service")
 
     a = sub.add_parser("add", help="create a profile")
@@ -315,6 +316,9 @@ def main(argv: "list[str] | None" = None) -> int:
     if cmd == "gui":
         from . import gui
         return gui.run(hidden=args.hidden)
+    if cmd == "overlay":
+        from .overlay.app import run as run_overlay
+        return run_overlay()
     if cmd == "geo-update":
         return _geo_update(args.file)
     if cmd == "geo-status":

@@ -202,6 +202,14 @@ class ProfileStore:
                 self._save()
         return done
 
+    def unblock_left(self, p: Profile, d: str) -> "float | None":
+        """Seconds until this block switches itself off, or None (not blocked / no timer)."""
+        with self.lock:
+            after = getattr(p, f"auto_unblock_{d}_s")
+            if not (after > 0 and p.enabled and getattr(p, f"block_{d}")):
+                return None
+            return max(0.0, after - (self._clock() - self._since.get((p.qid, d), self._clock())))
+
     def unblock_due(self) -> "float | None":
         """Seconds until the next auto-unblock, or None when none is pending."""
         with self.lock:

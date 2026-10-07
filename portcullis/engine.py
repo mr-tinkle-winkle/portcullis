@@ -183,6 +183,26 @@ class Engine:
             return {"profiles": profiles, "error": self.error, "queue_errors": self.queues.errors(),
                     "held_packets": self.queues.held()}
 
+    def blocks(self) -> "list[dict]":
+        """What is blocked right now (for the on-screen overlay): one entry per switched-on profile that blocks
+        anything -- a whole direction, a named port or single addresses."""
+        with self.lock:
+            out = []
+            for p in self.store.all():
+                if not p.enabled:
+                    continue
+                ports_off = [x["name"] for x in p.ports if not x["enabled"]]
+                addresses = sum(1 for r in p.rules if r["verdict"] == "block")
+                if not (p.block_in or p.block_out or ports_off or addresses):
+                    continue
+                out.append({"name": p.name, "match": list(p.match),
+                            "running": bool(self._matches.get(p.name)),
+                            "in": p.block_in, "out": p.block_out,
+                            "in_left": self.store.unblock_left(p, "in"), "out_left": self.store.unblock_left(p, "out"),
+                            "keep_alive": p.block_out_above if p.block_out else 0,
+                            "ports_off": ports_off, "addresses": addresses})
+            return out
+
     def overview(self) -> dict:
         """Everything the map UI draws, in one call: every app (running, with a profile, or recently
         seen) with its settings, its remotes and what governs each of them."""

@@ -77,6 +77,14 @@ one from the tray once.)
 table (`ss`, which needs no privileges) and stay marked open as long as the socket exists. That covers TCP;
 UDP flows that started before the service still only appear once they send a new flow.
 
+**Overlay**: a small panel in a screen corner listing what's blocked right now (OUT in blue, IN in orange,
+switched-off ports in purple, a countdown when an auto-unblock is running); nothing is on screen while nothing is
+blocked. It's its own process, `portcullis overlay`, started with your session by the NixOS module
+(`services.portcullis.overlay = false;` to turn that off). Corner, distance, size and what it lists:
+Settings -> Overlay, with a preview; changes apply live. On Wayland it's a layer-shell surface (same approach as
+afterglow's indicator: a small LayerShellQt shim built by the flake), so it stays above fullscreen games and
+ignores the mouse.
+
 **Service down?** The red banner has a **Restart service** button (`systemctl restart portcullis.service`); the
 NixOS module adds a polkit rule so members of the `portcullis` group can do that without a password.
 

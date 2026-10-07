@@ -38,6 +38,13 @@ class GuiConfig:
     show_hidden: bool = False            # still list hidden apps (dimmed) on the left
     map_mode: str = "flat"               # "flat" | "globe"
     split_sizes: list = field(default_factory=list)      # widths of app list | map | connection panel
+    overlay_enabled: bool = True         # the on-screen "what's blocked" panel (portcullis overlay)
+    overlay_corner: str = "top-right"    # top-left | top-right | bottom-left | bottom-right
+    overlay_margin: int = 24             # px from the screen edges
+    overlay_scale: float = 1.0
+    overlay_ports: bool = True           # list switched-off named ports too
+    overlay_addresses: bool = False      # list single blocked addresses too
+    overlay_only_running: bool = True    # skip apps that aren't running
     signal_input: str = "#f2994a"        # orange: input / incoming
     signal_output: str = "#4da3ff"       # blue: output / outgoing
     signal_special: str = "#b07cff"      # purple: both directions / special
@@ -52,6 +59,10 @@ class GuiConfig:
         self.pinned = list(dict.fromkeys(str(x) for x in self.pinned if isinstance(x, str) and x))
         self.hidden_apps = list(dict.fromkeys(x for x in self.hidden_apps if isinstance(x, str) and x))
         self.hidden_remotes = list(dict.fromkeys(x for x in self.hidden_remotes if isinstance(x, str) and "|" in x))
+        if self.overlay_corner not in ("top-left", "top-right", "bottom-left", "bottom-right"):
+            self.overlay_corner = "top-right"
+        self.overlay_margin = max(0, min(400, int(self.overlay_margin)))
+        self.overlay_scale = max(0.5, min(3.0, float(self.overlay_scale)))
         if self.map_mode not in ("flat", "globe"):
             self.map_mode = "flat"
         sizes = [int(x) for x in self.split_sizes if isinstance(x, int) and not isinstance(x, bool)]

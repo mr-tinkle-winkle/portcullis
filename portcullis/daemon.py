@@ -43,6 +43,8 @@ class Controller:
             if cmd == "remove":
                 self.store.remove(req["name"])
                 return self._changed({"ok": True})
+            if cmd == "blocks":
+                return {"ok": True, "blocks": self.engine.blocks()}
             if cmd == "overview":
                 return {"ok": True, **self.engine.overview()}
             if cmd == "rule":                      # {identity, ip, [port, proto], verdict: allow|block|clear}
